@@ -35,3 +35,4 @@ libgl1-mesa-dri
 libglapi-mesa
 libglx-mesa0
 libnss3
+libasound2t64
