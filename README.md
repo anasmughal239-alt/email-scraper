@@ -145,6 +145,32 @@ full contents of `email_scraper.py` into a Colab cell (or upload the file via
 the Colab file-browser "Upload" button) and `import email_scraper as es` will
 work the same way.
 
+## Deploying an always-on version (Railway)
+
+Streamlit Community Cloud (above) is free but sleeps the app after
+inactivity and has no persistent job state. For an always-on dashboard,
+this repo includes a `Dockerfile` for Railway (or any Docker host):
+
+1. Push this repo to GitHub (already done if you're reading this from there).
+2. On [railway.app](https://railway.app), connect the GitHub repo — Railway
+   auto-detects the `Dockerfile` and uses it to build.
+3. Railway assigns a `$PORT` env var at runtime; the `Dockerfile`'s `CMD`
+   already binds Streamlit to it (`--server.port $PORT --server.address 0.0.0.0`).
+4. Railway gives you a public URL once the build finishes.
+
+The `Dockerfile`'s apt package list is the same one already debugged for
+Streamlit Cloud (see the packages.txt section above for that story), but
+Railway's build environment is a plain `python:3.11-slim` (Debian bookworm)
+rather than Streamlit Cloud's mixed-repo image, so **the exact same package
+names aren't guaranteed to work first try** — if the build fails on an apt
+package, share the build log and it can be adjusted the same way we fixed
+`packages.txt`, by name.
+
+This does **not** speed up scraping itself — that's bound by target-site
+response times and worker/delay settings, not hosting location. What it
+does give you: no cold-start sleep, and a stable place to run long batches
+without tying up your own machine.
+
 ## Notes, limits, and things to know before relying on this
 
 - **Free datacenter proxies are not recommended.** Most public free-proxy
