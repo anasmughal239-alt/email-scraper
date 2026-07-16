@@ -52,6 +52,19 @@ playwright install chromium
 python email_scraper.py --input domains.txt --output results.csv --use-playwright
 ```
 
+### Playwright on Streamlit Community Cloud
+
+`packages.txt` in this repo lists the apt-level system libraries Chromium
+needs (fonts, `libnss3`, `libatk-bridge2.0-0`, etc.) — Streamlit Cloud installs
+these automatically during build. It does **not**, however, run
+`playwright install chromium` for you, since it only supports `packages.txt`
+(apt) and `requirements.txt` (pip), not arbitrary build commands. To cover
+this, `PlaywrightFetcher` self-heals: if Chromium's binary is missing on first
+use, it downloads it automatically (~300MB) before continuing. This means the
+**first** Playwright-enabled scrape after a cold start or redeploy is slow
+(1-2 extra minutes), since Streamlit Cloud's filesystem is ephemeral and the
+download isn't cached across container restarts/sleeps.
+
 ## Google Colab usage
 
 Paste this into a Colab cell:

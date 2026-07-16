@@ -492,14 +492,32 @@ class PlaywrightFetcher:
     def __enter__(self):
         from playwright.sync_api import sync_playwright  # raises ImportError if not installed
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=True)
+        try:
+            self._browser = self._pw.chromium.launch(headless=True)
+        except Exception as exc:
+            # Hosts like Streamlit Cloud install apt deps via packages.txt but
+            # have no build hook to download the actual browser binary, so the
+            # first Playwright-enabled run on a fresh container needs to fetch
+            # it here — a one-time ~300MB download, slow but self-healing.
+            if "Executable doesn't exist" not in str(exc):
+                self._pw.stop()
+                raise
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+            self._browser = self._pw.chromium.launch(headless=True)
         return self
 
     def fetch(self, url: str) -> Optional[str]:
         try:
             page = self._browser.new_page(user_agent=random.choice(USER_AGENTS))
             try:
-                page.goto(url, timeout=PLAYWRIGHT_PAGE_TIMEOUT_MS, wait_until="networkidle")
+                # "networkidle" is unreliable on real sites — analytics beacons,
+                # chat widgets, and websockets keep the network busy forever on
+                # many pages, turning this into a guaranteed timeout. Wait for
+                # the DOM instead, then give client-side rendering a moment.
+                page.goto(url, timeout=PLAYWRIGHT_PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)
                 return page.content()
             finally:
                 page.close()
