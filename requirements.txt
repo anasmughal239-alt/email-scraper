@@ -7,6 +7,8 @@ dnspython>=2.6
 streamlit>=1.35
 pandas>=2.2
 
-# Optional, only needed for --use-playwright (JS-rendered footer fallback):
-#   pip install playwright
-#   playwright install chromium
+# Needed for --use-playwright / the "Use Playwright fallback" checkbox
+# (JS-rendered footer fallback). The Chromium *binary* itself still isn't
+# installed by this — see packages.txt and the self-install logic in
+# PlaywrightFetcher for that part.
+playwright>=1.40

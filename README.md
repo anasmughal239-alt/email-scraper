@@ -46,8 +46,10 @@ domain's static pass already found zero emails, since spinning up a browser
 is much slower than a plain HTTP request — expect roughly 5-15s extra per
 affected domain, not per whole batch.
 
+`playwright` is already in `requirements.txt`, so `pip install -r requirements.txt`
+covers the Python package. The browser binary is a separate download:
+
 ```bash
-pip install playwright
 playwright install chromium
 python email_scraper.py --input domains.txt --output results.csv --use-playwright
 ```
