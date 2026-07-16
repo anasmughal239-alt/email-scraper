@@ -9,6 +9,7 @@ Deploy free:   push this folder to a GitHub repo, connect it at
                https://streamlit.io/cloud
 """
 
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -90,10 +91,12 @@ if run_clicked:
 
     progress_bar = st.progress(0.0)
     status_text = st.empty()
+    timer_text = st.empty()
     table_placeholder = st.empty()
 
     rows = []
     total = len(domains)
+    start_time = time.time()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(es.process_domain, url, delay, proxies, verify_mx,
@@ -103,18 +106,32 @@ if run_clicked:
         for done, future in enumerate(as_completed(futures), start=1):
             r = future.result()
             rows.append(es.result_to_row(r))
+            elapsed = time.time() - start_time
 
             progress_bar.progress(done / total)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
             status_text.text(f"[{done}/{total}] {r.domain or r.input_url}: {status}")
+            rate = done / elapsed if elapsed > 0 else 0
+            remaining = (total - done) / rate if rate > 0 else 0
+            timer_text.text(
+                f"Elapsed: {elapsed:.0f}s | Rate: {rate:.1f} domains/s | "
+                f"Est. remaining: {remaining:.0f}s"
+            )
             table_placeholder.dataframe(pd.DataFrame(rows), width='stretch')
 
+    total_elapsed = time.time() - start_time
     st.session_state.results = rows
-    st.success(f"Done — {total} domain(s) processed.")
+    st.session_state.last_run_seconds = total_elapsed
+    st.success(f"Done — {total} domain(s) processed in {total_elapsed:.1f}s "
+               f"({total_elapsed / total:.1f}s/domain average).")
 
 if st.session_state.results:
     df = pd.DataFrame(st.session_state.results)
     st.subheader("Results")
+    if st.session_state.get("last_run_seconds"):
+        secs = st.session_state.last_run_seconds
+        st.caption(f"Last run took {secs:.1f}s for {len(df)} domain(s) "
+                   f"({secs / len(df):.1f}s/domain average).")
     st.dataframe(df, width='stretch')
     st.download_button(
         "Download results.csv",
