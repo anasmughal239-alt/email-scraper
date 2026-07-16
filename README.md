@@ -2,15 +2,20 @@
 
 Finds public contact emails for a list of websites by:
 
-1. Reading `robots.txt` for declared sitemaps, plus guessing common sitemap paths
-   (`sitemap.xml`, `sitemap_index.xml`, `sitemap-index.xml`, `wp-sitemap.xml`, `sitemap.xml.gz`).
+1. Reading `robots.txt` for declared sitemaps **and honoring its `Disallow`
+   rules** — pages a site asks crawlers not to fetch are skipped (can be
+   turned off with `--ignore-robots` for sites you own). Also guesses common
+   sitemap paths (`sitemap.xml`, `sitemap_index.xml`, `wp-sitemap.xml`, ...).
 2. Recursively walking sitemap indexes to collect page URLs.
-3. Ranking URLs for contact-page likelihood (`contact`, `about`, `support`, `get-in-touch`, ...)
-   and fetching the top candidates.
-4. Falling back to the homepage + footer link discovery if no sitemap/contact page is found.
+3. Ranking URLs for contact-page likelihood (`contact`, `about`, `support`,
+   `get-in-touch`, plus Spanish/French/German/Italian/Portuguese/Dutch
+   equivalents) and fetching the top candidates.
+4. Falling back to the homepage + footer link discovery, then a shallow
+   second-hop crawl of same-domain nav links, if no sitemap/contact page is found.
 5. Extracting emails via `mailto:` links, plain-text regex, Cloudflare's
    `email-protection` obfuscation, and human-obfuscated text (`name [at] domain [dot] com`).
-6. Filtering out placeholder/tracking/false-positive addresses.
+6. Filtering out placeholder/tracking/false-positive addresses, and splitting
+   results into the company's own-domain emails vs. third-party emails.
 7. Optionally retrying with a headless browser (Playwright) when a domain's static
    fetch finds zero emails, to catch footers/contact info rendered by client-side JS.
 8. Writing results to CSV incrementally, so a crash or Colab disconnect doesn't lose progress.
@@ -34,8 +39,21 @@ Options:
 | `--proxies, -p` | none | optional file of proxy URLs, one per line |
 | `--verify-mx` | off | drop emails whose domain has no MX record (needs `dnspython`) |
 | `--use-playwright` | off | retry with headless Chromium when a domain's static fetch finds zero emails (needs `playwright`, see below) |
+| `--ignore-robots` | off (robots honored) | do **not** honor `robots.txt` Disallow rules — only for sites you own or have permission to crawl |
 
 Output CSV columns: `input_url, domain, own_domain_emails, other_domain_emails, method, source_pages, error`.
+
+## Running the tests
+
+The suite is offline and dependency-free (stdlib `unittest`) — every case
+corresponds to a real bug/false-positive fixed during development, so it
+guards against regressions:
+
+```bash
+python -m unittest test_email_scraper -v
+# or, if you have pytest:
+pytest test_email_scraper.py -v
+```
 
 ### Enabling the Playwright (JS-rendered footer) fallback
 

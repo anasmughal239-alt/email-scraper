@@ -34,6 +34,12 @@ with st.sidebar:
         "Verify MX records", value=False,
         help="Drops emails whose domain has no mail server. Requires dnspython.",
     )
+    respect_robots = st.checkbox(
+        "Respect robots.txt", value=True,
+        help="Honor each site's robots.txt Disallow rules and skip pages it "
+             "asks crawlers not to fetch. Recommended; leave on unless you own "
+             "the sites or have permission to crawl them.",
+    )
     use_playwright = st.checkbox(
         "Use Playwright fallback (JS-rendered footers)", value=False,
         help="Retries with a headless browser when a domain finds zero emails. "
@@ -85,7 +91,8 @@ if run_clicked:
     total = len(domains)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(es.process_domain, url, delay, proxies, verify_mx, use_playwright): url
+            executor.submit(es.process_domain, url, delay, proxies, verify_mx,
+                            use_playwright, respect_robots): url
             for url in domains
         }
         for done, future in enumerate(as_completed(futures), start=1):

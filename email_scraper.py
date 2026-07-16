@@ -31,6 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib import robotparser
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
@@ -171,6 +172,9 @@ MAX_SITEMAP_FETCHES_PER_DOMAIN = 50
 # a shallow second hop rather than a full crawl, to catch contact pages
 # that aren't sitemap-listed and aren't linked from the footer specifically.
 MAX_SECOND_HOP_LINKS = 5
+# User-agent token used when matching a site's robots.txt rules. We present
+# as a generic bot ("*"), so we obey the rules any site sets for all crawlers.
+ROBOTS_USER_AGENT = "*"
 
 
 # --------------------------------------------------------------------------
@@ -278,15 +282,48 @@ def get_bare_domain(base_url: str) -> str:
 # Step 2-3: sitemap discovery
 # --------------------------------------------------------------------------
 
-def sitemaps_from_robots(session: requests.Session, base_url: str) -> list:
+class RobotsPolicy:
+    """Holds a site's robots.txt rules: which URLs may be fetched, plus any
+    declared sitemaps. Fetched once per domain and threaded through the
+    pipeline so we can skip Disallow'd URLs before requesting them."""
+
+    def __init__(self, parser: Optional[robotparser.RobotFileParser], sitemaps: list, enabled: bool = True):
+        self._parser = parser
+        self.sitemaps = sitemaps
+        self.enabled = enabled
+
+    def can_fetch(self, url: str) -> bool:
+        # When compliance is off, or there's no usable robots.txt, allow all.
+        if not self.enabled or self._parser is None:
+            return True
+        try:
+            return self._parser.can_fetch(ROBOTS_USER_AGENT, url)
+        except Exception:
+            return True  # never let a robotparser quirk block the whole run
+
+
+def fetch_robots_policy(session: requests.Session, base_url: str, respect_robots: bool = True) -> RobotsPolicy:
+    """Fetch and parse robots.txt once. Extracts both the Disallow rules
+    (for can_fetch checks) and the declared Sitemap: URLs. A missing or
+    unreadable robots.txt fails open (allow all) — the conventional
+    behaviour for a well-behaved but functional crawler."""
     resp = fetch(session, urljoin(base_url, "/robots.txt"))
     if not resp:
-        return []
-    return [
+        return RobotsPolicy(None, [], enabled=respect_robots)
+
+    lines = resp.text.splitlines()
+    parser: Optional[robotparser.RobotFileParser] = robotparser.RobotFileParser()
+    try:
+        parser.parse(lines)
+    except Exception:
+        parser = None  # malformed robots.txt -> don't enforce, just skip
+
+    sitemaps = [
         line.split(":", 1)[1].strip()
-        for line in resp.text.splitlines()
+        for line in lines
         if line.lower().startswith("sitemap:")
     ]
+    return RobotsPolicy(parser, sitemaps, enabled=respect_robots)
 
 
 def parse_sitemap_xml(raw_bytes: bytes) -> tuple:
@@ -345,8 +382,10 @@ def fetch_sitemap_urls(session: requests.Session, sitemap_url: str, depth: int =
     return pages
 
 
-def discover_all_page_urls(session: requests.Session, base_url: str) -> list:
-    candidates = list(sitemaps_from_robots(session, base_url))
+def discover_all_page_urls(session: requests.Session, base_url: str,
+                            robots: Optional["RobotsPolicy"] = None) -> list:
+    # Sitemaps declared in robots.txt are already known; add common guesses.
+    candidates = list(robots.sitemaps) if robots else []
     candidates += [urljoin(base_url, p) for p in COMMON_SITEMAP_PATHS]
 
     all_pages, tried = [], set()
@@ -358,7 +397,11 @@ def discover_all_page_urls(session: requests.Session, base_url: str) -> list:
         pages = fetch_sitemap_urls(session, sm_url, fetch_counter=fetch_counter)
         if pages:
             all_pages.extend(pages)
-    return list(dict.fromkeys(all_pages))  # dedupe, preserve order
+
+    pages = list(dict.fromkeys(all_pages))  # dedupe, preserve order
+    if robots:
+        pages = [u for u in pages if robots.can_fetch(u)]
+    return pages
 
 
 # --------------------------------------------------------------------------
@@ -677,7 +720,7 @@ def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: l
 # --------------------------------------------------------------------------
 
 def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_mx: bool,
-                    use_playwright: bool = False) -> DomainResult:
+                    use_playwright: bool = False, respect_robots: bool = True) -> DomainResult:
     result = DomainResult(input_url=raw_url)
     base_url = normalize_to_base_url(raw_url)
     result.domain = get_bare_domain(base_url)
@@ -688,20 +731,24 @@ def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_m
     session = build_session(proxies)
 
     try:
-        all_pages = discover_all_page_urls(session, base_url)
+        robots = fetch_robots_policy(session, base_url, respect_robots=respect_robots)
+
+        all_pages = discover_all_page_urls(session, base_url, robots)
         contact_urls = rank_contact_urls(all_pages, base_url)
 
+        home_resp = None
         pages_to_check = []
         if contact_urls:
             result.method = "sitemap"
             pages_to_check = contact_urls
         else:
             result.method = "homepage-fallback"
-            home_resp = fetch(session, base_url)
+            if robots.can_fetch(base_url):
+                home_resp = fetch(session, base_url)
             if home_resp:
                 pages_to_check = [base_url]
                 extra_links = find_contact_links_on_page(home_resp.text, base_url)
-                pages_to_check += extra_links[:MAX_PAGES_PER_DOMAIN - 1]
+                pages_to_check += [u for u in extra_links if robots.can_fetch(u)][:MAX_PAGES_PER_DOMAIN - 1]
 
         if not pages_to_check:
             result.method = "none"
@@ -711,6 +758,8 @@ def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_m
             return result
 
         for page_url in pages_to_check[:MAX_PAGES_PER_DOMAIN]:
+            if not robots.can_fetch(page_url):
+                continue
             resp = fetch(session, page_url)
             time.sleep(delay)
             if not resp:
@@ -725,6 +774,8 @@ def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_m
         # from the homepage before giving up or falling back to Playwright.
         if not result.emails and result.method == "homepage-fallback" and home_resp:
             for page_url in find_second_hop_links(home_resp.text, base_url, set(pages_to_check)):
+                if not robots.can_fetch(page_url):
+                    continue
                 resp = fetch(session, page_url)
                 time.sleep(delay)
                 if not resp:
@@ -776,7 +827,7 @@ def load_proxies(path: Optional[str]) -> Optional[list]:
 
 def run_batch(input_path: str, output_path: str, max_workers: int = 5, delay: float = 1.0,
               proxies_path: Optional[str] = None, verify_mx: bool = False,
-              use_playwright: bool = False) -> None:
+              use_playwright: bool = False, respect_robots: bool = True) -> None:
     domains = load_domains(input_path)
     proxies = load_proxies(proxies_path)
 
@@ -804,7 +855,8 @@ def run_batch(input_path: str, output_path: str, max_workers: int = 5, delay: fl
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(process_domain, url, delay, proxies, verify_mx, use_playwright): url
+                executor.submit(process_domain, url, delay, proxies, verify_mx,
+                                use_playwright, respect_robots): url
                 for url in domains
             }
             done_count = 0
@@ -842,6 +894,9 @@ def main():
     parser.add_argument("--use-playwright", action="store_true",
                          help="Retry with a headless browser (requires: pip install playwright && "
                               "playwright install chromium) when a domain's static fetch finds zero emails")
+    parser.add_argument("--ignore-robots", action="store_true",
+                         help="Do NOT honor robots.txt Disallow rules (default: honored). "
+                              "Only use on sites you own or have permission to crawl.")
     args = parser.parse_args()
 
     run_batch(
@@ -852,6 +907,7 @@ def main():
         proxies_path=args.proxies,
         verify_mx=args.verify_mx,
         use_playwright=args.use_playwright,
+        respect_robots=not args.ignore_robots,
     )
 
 
