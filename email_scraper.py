@@ -27,6 +27,7 @@ import csv
 import gzip
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -134,6 +135,7 @@ EMAIL_BLOCKLIST_DOMAINS = {
     "foo.com", "bar.com", "test.com", "placeholder.com", "notarealemail.com",
     "noemail.com", "yourcompany.com", "mycompany.com", "email.com", "website.com",
     "host.com", "doe.net", "doe.com",  # generic placeholder / "Jane Doe" domains
+    "xyzcorp.com",  # "XYZ Corp" — classic placeholder company name in docs/examples
     "mail.com",  # classic HTML placeholder text, e.g. <input placeholder="you@mail.com">
     "email.de",  # German equivalent placeholder domain (paired with "beispiel" = "example")
     "lovelace.app", "lovelace.com",  # "Ada Lovelace" — recurring tech-demo placeholder person
@@ -794,6 +796,16 @@ def domain_has_mx(domain: str) -> bool:
 # it's not worth paying that cost on every domain.
 
 PLAYWRIGHT_PAGE_TIMEOUT_MS = 20000
+# Each PlaywrightFetcher launches a real Chromium process (typically
+# 200-500MB+). Domain processing runs across many concurrent worker
+# threads, so without a cap, several domains needing the fallback at the
+# same time launch that many Chromium instances simultaneously — this is
+# exactly what caused an out-of-memory crash on a resource-constrained
+# host (Railway) even though the CLI/local runs never hit it. This
+# semaphore bounds concurrent Chromium instances independently of the
+# batch's overall --workers setting.
+MAX_CONCURRENT_PLAYWRIGHT_INSTANCES = 1
+_playwright_semaphore = threading.Semaphore(MAX_CONCURRENT_PLAYWRIGHT_INSTANCES)
 
 
 class PlaywrightFetcher:
@@ -844,47 +856,52 @@ class PlaywrightFetcher:
 
 def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: list, delay: float) -> None:
     """Re-fetches pages with a real headless browser when the static pass
-    found nothing, to catch footers/contact info rendered by client-side JS."""
-    try:
-        with PlaywrightFetcher() as pf:
-            urls_to_try = pages_to_check or [base_url]
-            extra_links: list = []
+    found nothing, to catch footers/contact info rendered by client-side JS.
+    Only MAX_CONCURRENT_PLAYWRIGHT_INSTANCES domains can be running a
+    Chromium instance at any moment — other domains needing the fallback
+    block here until a slot frees up, trading some wall-clock time for a
+    bounded memory ceiling regardless of --workers."""
+    with _playwright_semaphore:
+        try:
+            with PlaywrightFetcher() as pf:
+                urls_to_try = pages_to_check or [base_url]
+                extra_links: list = []
 
-            for page_url in urls_to_try[:MAX_PAGES_PER_DOMAIN]:
-                html = pf.fetch(page_url)
-                time.sleep(delay)
-                if not html:
-                    continue
-                if not pages_to_check:
-                    # Homepage was previously unreachable/empty; now that we
-                    # have JS-rendered HTML, look for contact links in it too.
-                    extra_links = find_contact_links_on_page(html, base_url)
-                found = extract_emails_from_html(html)
-                if found:
-                    result.emails |= found
-                    result.source_pages.add(page_url)
+                for page_url in urls_to_try[:MAX_PAGES_PER_DOMAIN]:
+                    html = pf.fetch(page_url)
+                    time.sleep(delay)
+                    if not html:
+                        continue
+                    if not pages_to_check:
+                        # Homepage was previously unreachable/empty; now that we
+                        # have JS-rendered HTML, look for contact links in it too.
+                        extra_links = find_contact_links_on_page(html, base_url)
+                    found = extract_emails_from_html(html)
+                    if found:
+                        result.emails |= found
+                        result.source_pages.add(page_url)
 
-            for link_url in extra_links[:MAX_PAGES_PER_DOMAIN - 1]:
-                html = pf.fetch(link_url)
-                time.sleep(delay)
-                if not html:
-                    continue
-                found = extract_emails_from_html(html)
-                if found:
-                    result.emails |= found
-                    result.source_pages.add(link_url)
+                for link_url in extra_links[:MAX_PAGES_PER_DOMAIN - 1]:
+                    html = pf.fetch(link_url)
+                    time.sleep(delay)
+                    if not html:
+                        continue
+                    found = extract_emails_from_html(html)
+                    if found:
+                        result.emails |= found
+                        result.source_pages.add(link_url)
 
-        if result.emails:
-            result.method = f"{result.method}+playwright"
-            result.error = ""
-        else:
-            result.error = result.error or "no emails found on checked pages (incl. JS-rendered)"
+            if result.emails:
+                result.method = f"{result.method}+playwright"
+                result.error = ""
+            else:
+                result.error = result.error or "no emails found on checked pages (incl. JS-rendered)"
 
-    except ImportError:
-        result.error = (
-            (result.error + "; " if result.error else "")
-            + "playwright not installed — run: pip install playwright && playwright install chromium"
-        )
+        except ImportError:
+            result.error = (
+                (result.error + "; " if result.error else "")
+                + "playwright not installed — run: pip install playwright && playwright install chromium"
+            )
 
 
 # --------------------------------------------------------------------------
