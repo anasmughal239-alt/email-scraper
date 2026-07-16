@@ -105,7 +105,7 @@ if run_clicked:
             progress_bar.progress(done / total)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
             status_text.text(f"[{done}/{total}] {r.domain or r.input_url}: {status}")
-            table_placeholder.dataframe(pd.DataFrame(rows), use_container_width=True)
+            table_placeholder.dataframe(pd.DataFrame(rows), width='stretch')
 
     st.session_state.results = rows
     st.success(f"Done — {total} domain(s) processed.")
@@ -113,7 +113,7 @@ if run_clicked:
 if st.session_state.results:
     df = pd.DataFrame(st.session_state.results)
     st.subheader("Results")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width='stretch')
     st.download_button(
         "Download results.csv",
         data=df.to_csv(index=False).encode("utf-8"),
