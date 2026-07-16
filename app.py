@@ -28,8 +28,13 @@ if "results" not in st.session_state:
 
 with st.sidebar:
     st.header("Settings")
-    workers = st.slider("Concurrent domains", 1, 20, 8)
-    delay = st.slider("Delay between page fetches (s)", 0.0, 3.0, 0.5, 0.1)
+    workers = st.slider("Concurrent domains", 1, 20, 10)
+    delay = st.slider(
+        "Page-fetch stagger (s)", 0.0, 3.0, 0.3, 0.1,
+        help="Pages within one domain are fetched concurrently, not one at a time. "
+             "This staggers when each fetch starts, as a soft rate limit — it no "
+             "longer serializes the whole domain the way it used to.",
+    )
     verify_mx = st.checkbox(
         "Verify MX records", value=False,
         help="Drops emails whose domain has no mail server. Requires dnspython.",

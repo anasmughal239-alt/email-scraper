@@ -174,16 +174,33 @@ OBFUSCATED_EMAIL_RE = re.compile(
 )
 
 REQUEST_TIMEOUT = 12
+# A domain that's dead/blocked at the network level (not just a slow real
+# site) usually fails just as fast at 6s as at 12s — this shorter timeout
+# is used only for the initial reachability probe, so we don't wait the
+# full REQUEST_TIMEOUT (x up to 3 attempts with retries) before deciding
+# whether it's even worth trying the 7 guessed sitemap paths.
+FAST_FAIL_PROBE_TIMEOUT = 6
 MAX_SITEMAP_DEPTH = 3
 MAX_PAGES_PER_DOMAIN = 10
 # Large e-commerce/blog sites can have sitemap trees with thousands of child
 # files (per-locale, per-collection, per-year archives). Cap total sitemap
 # fetches per domain so one domain can't stall the whole batch.
 MAX_SITEMAP_FETCHES_PER_DOMAIN = 50
+# The fetch-count cap above bounds sitemap *files*, but a single file can
+# list tens of thousands of URLs (e.g. figma.com's community-file index
+# sitemap has 367,890 entries) — that alone made sitemap discovery take
+# 100+ seconds for one domain, dwarfing everything else in the pipeline.
+# This caps the total *page* count collected, so a handful of huge leaf
+# sitemaps can't blow up runtime even while staying under the file cap.
+MAX_TOTAL_SITEMAP_PAGES = 5000
 # Extra same-domain links tried when sitemap + footer both find nothing —
 # a shallow second hop rather than a full crawl, to catch contact pages
 # that aren't sitemap-listed and aren't linked from the footer specifically.
 MAX_SECOND_HOP_LINKS = 5
+# How many candidate pages to fetch concurrently within a single domain —
+# these fetches are independent of each other, so there's no reason to
+# fetch them one at a time.
+PER_DOMAIN_FETCH_WORKERS = 4
 # User-agent token used when matching a site's robots.txt rules. We present
 # as a generic bot ("*"), so we obey the rules any site sets for all crawlers.
 ROBOTS_USER_AGENT = "*"
@@ -365,6 +382,36 @@ def fetch(session: requests.Session, url: str, timeout: int = REQUEST_TIMEOUT) -
     return None
 
 
+def probe_domain_reachable(base_url: str) -> bool:
+    """Quick, short-timeout connectivity check, used to skip a dead/blocked
+    domain fast instead of paying for a full robots.txt fetch plus up to 7
+    guessed sitemap paths — each through the main session's retry-with-
+    backoff logic — before discovering the same thing. A site that responds
+    at all (even with an error status like 403) counts as reachable, since
+    error responses return immediately without retries; it's a fully failed
+    connection (timeout/refused/DNS failure) that's slow today, and this
+    probe targets exactly that case.
+
+    Allows one retry: a single-attempt version produced a real false
+    negative in testing (mysql.com flagged unreachable once, then answered
+    normally on the very next attempt — an ordinary transient network blip,
+    not a dead site). Worst case for a genuinely dead domain is now
+    2x FAST_FAIL_PROBE_TIMEOUT instead of 1x, still far cheaper than the
+    multi-attempt path it's replacing."""
+    for _ in range(2):
+        try:
+            requests.get(
+                base_url,
+                headers={"User-Agent": random.choice(USER_AGENTS)},
+                timeout=FAST_FAIL_PROBE_TIMEOUT,
+                allow_redirects=True,
+            )
+            return True
+        except requests.RequestException:
+            continue
+    return False
+
+
 # --------------------------------------------------------------------------
 # Step 1: URL/domain normalization
 # --------------------------------------------------------------------------
@@ -460,12 +507,17 @@ def parse_sitemap_xml(raw_bytes: bytes) -> tuple:
 
 
 def fetch_sitemap_urls(session: requests.Session, sitemap_url: str, depth: int = 0,
-                        seen: Optional[set] = None, fetch_counter: Optional[list] = None) -> list:
+                        seen: Optional[set] = None, fetch_counter: Optional[list] = None,
+                        page_count: Optional[list] = None) -> list:
     if seen is None:
         seen = set()
     if fetch_counter is None:
         fetch_counter = [0]
-    if depth > MAX_SITEMAP_DEPTH or sitemap_url in seen or fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN:
+    if page_count is None:
+        page_count = [0]
+    if (depth > MAX_SITEMAP_DEPTH or sitemap_url in seen
+            or fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN
+            or page_count[0] >= MAX_TOTAL_SITEMAP_PAGES):
         return []
     seen.add(sitemap_url)
     fetch_counter[0] += 1
@@ -482,10 +534,11 @@ def fetch_sitemap_urls(session: requests.Session, sitemap_url: str, depth: int =
             pass
 
     children, pages = parse_sitemap_xml(raw)
+    page_count[0] += len(pages)
     for child in children:
-        if fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN:
+        if fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN or page_count[0] >= MAX_TOTAL_SITEMAP_PAGES:
             break
-        pages.extend(fetch_sitemap_urls(session, child, depth + 1, seen, fetch_counter))
+        pages.extend(fetch_sitemap_urls(session, child, depth + 1, seen, fetch_counter, page_count))
     return pages
 
 
@@ -497,11 +550,13 @@ def discover_all_page_urls(session: requests.Session, base_url: str,
 
     all_pages, tried = [], set()
     fetch_counter = [0]
+    page_count = [0]
     for sm_url in candidates:
-        if sm_url in tried or fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN:
+        if (sm_url in tried or fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN
+                or page_count[0] >= MAX_TOTAL_SITEMAP_PAGES):
             continue
         tried.add(sm_url)
-        pages = fetch_sitemap_urls(session, sm_url, fetch_counter=fetch_counter)
+        pages = fetch_sitemap_urls(session, sm_url, fetch_counter=fetch_counter, page_count=page_count)
         if pages:
             all_pages.extend(pages)
 
@@ -836,6 +891,40 @@ def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: l
 # Per-domain pipeline
 # --------------------------------------------------------------------------
 
+def fetch_and_extract_pages(session: requests.Session, urls: list, robots: "RobotsPolicy",
+                             delay: float) -> tuple:
+    """Fetches a domain's candidate pages concurrently (they're independent
+    of each other, so there's no reason to wait for one before starting the
+    next) and extracts emails from each. `delay` staggers when each fetch
+    *starts* rather than serializing them — a soft rate limit that still
+    lets slow pages run in the background instead of blocking faster ones."""
+    emails: set = set()
+    source_pages: set = set()
+    allowed_urls = [u for u in urls if robots.can_fetch(u)]
+    if not allowed_urls:
+        return emails, source_pages
+
+    def _fetch_one(url: str) -> tuple:
+        resp = fetch(session, url)
+        if not resp:
+            return url, None
+        return url, extract_emails_from_html(resp.text)
+
+    max_workers = min(PER_DOMAIN_FETCH_WORKERS, len(allowed_urls))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for url in allowed_urls:
+            futures.append(executor.submit(_fetch_one, url))
+            if delay:
+                time.sleep(delay)
+        for future in as_completed(futures):
+            url, found = future.result()
+            if found:
+                emails |= found
+                source_pages.add(url)
+    return emails, source_pages
+
+
 def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_mx: bool,
                     use_playwright: bool = False, respect_robots: bool = True) -> DomainResult:
     result = DomainResult(input_url=raw_url)
@@ -843,6 +932,13 @@ def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_m
     result.domain = get_bare_domain(base_url)
     if not result.domain:
         result.error = "could not parse domain"
+        return result
+
+    if not probe_domain_reachable(base_url):
+        result.method = "none"
+        result.error = "domain unreachable (fast-fail connectivity probe)"
+        if use_playwright:
+            playwright_fallback(result, base_url, [], delay)
         return result
 
     session = build_session(proxies)
@@ -874,33 +970,20 @@ def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_m
                 playwright_fallback(result, base_url, pages_to_check, delay)
             return result
 
-        for page_url in pages_to_check[:MAX_PAGES_PER_DOMAIN]:
-            if not robots.can_fetch(page_url):
-                continue
-            resp = fetch(session, page_url)
-            time.sleep(delay)
-            if not resp:
-                continue
-            found = extract_emails_from_html(resp.text)
-            if found:
-                result.emails |= found
-                result.source_pages.add(page_url)
+        found, source_pages = fetch_and_extract_pages(
+            session, pages_to_check[:MAX_PAGES_PER_DOMAIN], robots, delay
+        )
+        result.emails |= found
+        result.source_pages |= source_pages
 
         # Shallow second hop: sitemap + footer-keyword discovery both failed
         # to surface anything useful, so try a few more same-domain nav links
         # from the homepage before giving up or falling back to Playwright.
         if not result.emails and result.method == "homepage-fallback" and home_resp:
-            for page_url in find_second_hop_links(home_resp.text, base_url, set(pages_to_check)):
-                if not robots.can_fetch(page_url):
-                    continue
-                resp = fetch(session, page_url)
-                time.sleep(delay)
-                if not resp:
-                    continue
-                found = extract_emails_from_html(resp.text)
-                if found:
-                    result.emails |= found
-                    result.source_pages.add(page_url)
+            second_hop_urls = find_second_hop_links(home_resp.text, base_url, set(pages_to_check))
+            found, source_pages = fetch_and_extract_pages(session, second_hop_urls, robots, delay)
+            result.emails |= found
+            result.source_pages |= source_pages
 
         if not result.emails and use_playwright:
             playwright_fallback(result, base_url, pages_to_check, delay)
@@ -972,7 +1055,7 @@ def result_to_row(r: "DomainResult") -> dict:
     }
 
 
-def run_batch(input_path: str, output_path: str, max_workers: int = 5, delay: float = 1.0,
+def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
               proxies_path: Optional[str] = None, verify_mx: bool = False,
               use_playwright: bool = False, respect_robots: bool = True) -> None:
     domains = load_domains(input_path)
@@ -1020,8 +1103,8 @@ def main():
     parser = argparse.ArgumentParser(description="Sitemap-aware contact email scraper")
     parser.add_argument("--input", "-i", required=True, help="Path to file with one URL/domain per line")
     parser.add_argument("--output", "-o", default="results.csv", help="Path to output CSV")
-    parser.add_argument("--workers", "-w", type=int, default=5, help="Concurrent domains to process")
-    parser.add_argument("--delay", "-d", type=float, default=1.0, help="Seconds to sleep between page fetches per domain")
+    parser.add_argument("--workers", "-w", type=int, default=10, help="Concurrent domains to process")
+    parser.add_argument("--delay", "-d", type=float, default=0.3, help="Seconds to stagger page-fetch starts within a domain")
     parser.add_argument("--proxies", "-p", default=None, help="Optional path to a file of proxy URLs, one per line")
     parser.add_argument("--verify-mx", action="store_true", help="Drop emails whose domain has no MX record (requires dnspython)")
     parser.add_argument("--use-playwright", action="store_true",
