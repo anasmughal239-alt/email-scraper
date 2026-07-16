@@ -29,7 +29,7 @@ import random
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib import robotparser
@@ -182,6 +182,16 @@ REQUEST_TIMEOUT = 12
 # full REQUEST_TIMEOUT (x up to 3 attempts with retries) before deciding
 # whether it's even worth trying the 7 guessed sitemap paths.
 FAST_FAIL_PROBE_TIMEOUT = 6
+# Hard ceiling on how long a single domain's worker thread may run before
+# a batch gives up on it. Found via a real hang: artstation.com's thread
+# ran 5+ minutes with zero CPU activity — well past what our own per-request
+# timeouts (REQUEST_TIMEOUT x retries) should ever allow — pointing to a
+# DNS/TLS-level stall outside requests' timeout coverage. Without this, one
+# such domain blocks an entire batch indefinitely, even with everything
+# else already done. Python cannot forcibly kill a stuck thread, so the
+# abandoned worker may keep running in the background, but this stops it
+# from blocking the batch's visible progress, CSV output, or completion.
+DOMAIN_HARD_TIMEOUT_SECONDS = 180
 MAX_SITEMAP_DEPTH = 3
 MAX_PAGES_PER_DOMAIN = 10
 # Large e-commerce/blog sites can have sitemap trees with thousands of child
@@ -194,7 +204,20 @@ MAX_SITEMAP_FETCHES_PER_DOMAIN = 50
 # 100+ seconds for one domain, dwarfing everything else in the pipeline.
 # This caps the total *page* count collected, so a handful of huge leaf
 # sitemaps can't blow up runtime even while staying under the file cap.
-MAX_TOTAL_SITEMAP_PAGES = 5000
+#
+# Regression found in a live run: an earlier value of 5000 was too tight —
+# fastly.com has 5525 legitimate pages, and its real /contact-us page got
+# cut off before being collected, silently losing a real result. 20000
+# gives ordinary large sites comfortable headroom while still taming
+# figma.com's extreme case (367,890 -> 20,000, an 18x cut).
+MAX_TOTAL_SITEMAP_PAGES = 20000
+# Sitemap *files* used to be fetched one at a time, recursively — a sitemap
+# index with many locale/category children (fastly.com's tree needed ~50
+# files to assemble its 5525 pages) took as long as the SUM of every file
+# fetch. This bounds how many sitemap-file fetches run concurrently via a
+# shared work-queue (BFS), so the same tree takes roughly as long as its
+# slowest single fetch instead.
+SITEMAP_FETCH_WORKERS = 6
 # Extra same-domain links tried when sitemap + footer both find nothing —
 # a shallow second hop rather than a full crawl, to catch contact pages
 # that aren't sitemap-listed and aren't linked from the footer specifically.
@@ -508,25 +531,13 @@ def parse_sitemap_xml(raw_bytes: bytes) -> tuple:
     return child_sitemaps, page_urls
 
 
-def fetch_sitemap_urls(session: requests.Session, sitemap_url: str, depth: int = 0,
-                        seen: Optional[set] = None, fetch_counter: Optional[list] = None,
-                        page_count: Optional[list] = None) -> list:
-    if seen is None:
-        seen = set()
-    if fetch_counter is None:
-        fetch_counter = [0]
-    if page_count is None:
-        page_count = [0]
-    if (depth > MAX_SITEMAP_DEPTH or sitemap_url in seen
-            or fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN
-            or page_count[0] >= MAX_TOTAL_SITEMAP_PAGES):
-        return []
-    seen.add(sitemap_url)
-    fetch_counter[0] += 1
-
+def _fetch_one_sitemap(session: requests.Session, sitemap_url: str) -> tuple:
+    """Fetches and parses a single sitemap file. Returns (child_sitemap_urls,
+    page_urls) — no recursion, no shared state; the caller (discover_all_page_urls)
+    owns the BFS traversal and bookkeeping."""
     resp = fetch(session, sitemap_url)
     if not resp:
-        return []
+        return [], []
 
     raw = resp.content
     if raw[:2] == b"\x1f\x8b":
@@ -535,32 +546,46 @@ def fetch_sitemap_urls(session: requests.Session, sitemap_url: str, depth: int =
         except OSError:
             pass
 
-    children, pages = parse_sitemap_xml(raw)
-    page_count[0] += len(pages)
-    for child in children:
-        if fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN or page_count[0] >= MAX_TOTAL_SITEMAP_PAGES:
-            break
-        pages.extend(fetch_sitemap_urls(session, child, depth + 1, seen, fetch_counter, page_count))
-    return pages
+    return parse_sitemap_xml(raw)
 
 
 def discover_all_page_urls(session: requests.Session, base_url: str,
                             robots: Optional["RobotsPolicy"] = None) -> list:
+    """Breadth-first, concurrent sitemap discovery. A sitemap index with many
+    locale/category child files used to be fetched one at a time, recursively
+    — taking as long as the SUM of every file fetch. This processes one
+    "wave" of URLs at a time through a shared thread pool, so a wide sitemap
+    tree takes roughly as long as its slowest single fetch instead."""
     # Sitemaps declared in robots.txt are already known; add common guesses.
     candidates = list(robots.sitemaps) if robots else []
     candidates += [urljoin(base_url, p) for p in COMMON_SITEMAP_PATHS]
 
-    all_pages, tried = [], set()
-    fetch_counter = [0]
-    page_count = [0]
-    for sm_url in candidates:
-        if (sm_url in tried or fetch_counter[0] >= MAX_SITEMAP_FETCHES_PER_DOMAIN
-                or page_count[0] >= MAX_TOTAL_SITEMAP_PAGES):
-            continue
-        tried.add(sm_url)
-        pages = fetch_sitemap_urls(session, sm_url, fetch_counter=fetch_counter, page_count=page_count)
-        if pages:
-            all_pages.extend(pages)
+    all_pages: list = []
+    seen: set = set()
+    fetch_count = 0
+    page_count = 0
+    frontier = [u for u in dict.fromkeys(candidates) if u not in seen]
+
+    with ThreadPoolExecutor(max_workers=SITEMAP_FETCH_WORKERS) as executor:
+        depth = 0
+        while frontier and fetch_count < MAX_SITEMAP_FETCHES_PER_DOMAIN and page_count < MAX_TOTAL_SITEMAP_PAGES:
+            wave = frontier[:MAX_SITEMAP_FETCHES_PER_DOMAIN - fetch_count]
+            for u in wave:
+                seen.add(u)
+            fetch_count += len(wave)
+
+            futures = {executor.submit(_fetch_one_sitemap, session, u): u for u in wave}
+            next_frontier: list = []
+            for future in as_completed(futures):
+                children, pages = future.result()
+                if pages:
+                    all_pages.extend(pages)
+                    page_count += len(pages)
+                if depth < MAX_SITEMAP_DEPTH:
+                    next_frontier.extend(c for c in children if c not in seen)
+
+            frontier = list(dict.fromkeys(next_frontier))
+            depth += 1
 
     pages = list(dict.fromkeys(all_pages))  # dedupe, preserve order
     if robots:
@@ -1072,6 +1097,39 @@ def result_to_row(r: "DomainResult") -> dict:
     }
 
 
+def drain_futures_with_hard_timeout(futures_to_url: dict, per_domain_timeout: float = DOMAIN_HARD_TIMEOUT_SECONDS):
+    """Yields (url, DomainResult) as domain-processing futures complete, but
+    gives up on any single future that's been pending longer than
+    per_domain_timeout — rather than letting one stuck domain block every
+    other (already-finished-or-finishing) domain in the batch forever.
+    Shared by the CLI batch runner and the Streamlit dashboard.
+
+    Python has no way to forcibly kill a running thread, so an abandoned
+    worker may keep executing in the background after being given up on —
+    this only stops it from blocking the caller's progress/output."""
+    pending = dict(futures_to_url)  # future -> url
+    started_at = {f: time.time() for f in pending}
+    while pending:
+        done, _ = wait(pending.keys(), timeout=5, return_when=FIRST_COMPLETED)
+        now = time.time()
+        for f in list(done):
+            url = pending.pop(f)
+            started_at.pop(f, None)
+            yield url, f.result()
+        for f in list(pending.keys()):
+            if now - started_at[f] >= per_domain_timeout:
+                url = pending.pop(f)
+                started_at.pop(f, None)
+                r = DomainResult(input_url=url)
+                r.domain = get_bare_domain(normalize_to_base_url(url))
+                r.method = "none"
+                r.error = (
+                    f"gave up after {per_domain_timeout:.0f}s - domain appears stuck "
+                    "beyond normal timeouts (e.g. a DNS/TLS-level stall)"
+                )
+                yield url, r
+
+
 def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
               proxies_path: Optional[str] = None, verify_mx: bool = False,
               use_playwright: bool = False, respect_robots: bool = True) -> None:
@@ -1096,20 +1154,25 @@ def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: f
         writer.writeheader()
         f.flush()
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {
                 executor.submit(process_domain, url, delay, proxies, verify_mx,
                                 use_playwright, respect_robots): url
                 for url in domains
             }
             done_count = 0
-            for future in as_completed(futures):
-                r = future.result()
+            for _url, r in drain_futures_with_hard_timeout(futures):
                 writer.writerow(result_to_row(r))
                 f.flush()
                 done_count += 1
                 status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
                 print(f"[{done_count}/{len(domains)}] {r.domain or r.input_url}: {status}", flush=True)
+        finally:
+            # wait=False: if a domain was abandoned above for exceeding the
+            # hard timeout, its thread may still be running — don't let our
+            # own shutdown block on it too.
+            executor.shutdown(wait=False)
 
 
 # --------------------------------------------------------------------------

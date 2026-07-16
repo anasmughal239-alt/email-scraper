@@ -306,5 +306,42 @@ class TestUrlNormalization(unittest.TestCase):
         self.assertEqual(es.get_bare_domain("https://www.example.com"), "example.com")
 
 
+class TestDrainFuturesWithHardTimeout(unittest.TestCase):
+    def test_stuck_future_does_not_block_others(self):
+        # Regression: a genuinely hung domain (artstation.com, 5+ minutes
+        # with zero CPU activity — a DNS/TLS-level stall beyond the
+        # scraper's own request timeouts) blocked an entire 300-domain
+        # batch indefinitely, even with 299/300 already done. This proves
+        # the drain function gives up on a stuck future instead of waiting
+        # for it, without disturbing a concurrently-completing fast one.
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fast():
+            return "fast result"
+
+        def stuck():
+            time.sleep(30)
+            return "should never be reached within the test's timeout"
+
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
+            futures = {
+                executor.submit(fast): "fast.com",
+                executor.submit(stuck): "stuck.com",
+            }
+            t0 = time.time()
+            results = dict(es.drain_futures_with_hard_timeout(futures, per_domain_timeout=1))
+            elapsed = time.time() - t0
+        finally:
+            executor.shutdown(wait=False)
+
+        # Must return well before the stuck task's 30s sleep would finish.
+        self.assertLess(elapsed, 15)
+        self.assertEqual(results["fast.com"], "fast result")
+        self.assertTrue(hasattr(results["stuck.com"], "error"))
+        self.assertIn("gave up after", results["stuck.com"].error)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

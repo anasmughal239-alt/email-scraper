@@ -10,7 +10,7 @@ Deploy free:   push this folder to a GitHub repo, connect it at
 """
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import streamlit as st
@@ -97,14 +97,17 @@ if run_clicked:
     rows = []
     total = len(domains)
     start_time = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {
             executor.submit(es.process_domain, url, delay, proxies, verify_mx,
                             use_playwright, respect_robots): url
             for url in domains
         }
-        for done, future in enumerate(as_completed(futures), start=1):
-            r = future.result()
+        # A hard per-domain timeout so one stuck domain (e.g. a DNS/TLS-level
+        # stall beyond the scraper's own request timeouts) can't block the
+        # rest of the batch, or leave the dashboard stuck mid-run forever.
+        for done, (_url, r) in enumerate(es.drain_futures_with_hard_timeout(futures), start=1):
             rows.append(es.result_to_row(r))
             elapsed = time.time() - start_time
 
@@ -118,6 +121,8 @@ if run_clicked:
                 f"Est. remaining: {remaining:.0f}s"
             )
             table_placeholder.dataframe(pd.DataFrame(rows), width='stretch')
+    finally:
+        executor.shutdown(wait=False)
 
     total_elapsed = time.time() - start_time
     st.session_state.results = rows
