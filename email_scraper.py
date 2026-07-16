@@ -132,9 +132,13 @@ EMAIL_BLOCKLIST_DOMAINS = {
     "hostname.com",  # placeholder domain used in sysadmin/nginx-style tutorials
     "encom.com",  # fictional company from Tron, common tech-demo placeholder
     "foo.com", "bar.com", "test.com", "placeholder.com", "notarealemail.com",
-    "noemail.com", "yourcompany.com", "mycompany.com", "email.com",
+    "noemail.com", "yourcompany.com", "mycompany.com", "email.com", "website.com",
+    "host.com", "doe.net", "doe.com",  # generic placeholder / "Jane Doe" domains
     "mail.com",  # classic HTML placeholder text, e.g. <input placeholder="you@mail.com">
     "email.de",  # German equivalent placeholder domain (paired with "beispiel" = "example")
+    "lovelace.app", "lovelace.com",  # "Ada Lovelace" — recurring tech-demo placeholder person
+    # Multi-language "your company" placeholder domains, matching yourcompany.com.
+    "ihrefirma.com", "tuempresa.com", "suaempresa.com",
     # Disposable/temporary email services — never a real long-term contact.
     "mailinator.com", "guerrillamail.com", "10minutemail.com", "temp-mail.org",
     "tempmail.com", "throwawaymail.com", "mailnesia.com", "trashmail.com",
@@ -650,6 +654,14 @@ def is_valid_candidate(email: str) -> bool:
     if not local or not domain:
         return False
     domain = domain.lower()
+    # A real hostname never contains whitespace or URL-special characters —
+    # guards against a leftover query string (e.g. a mailto: href whose "?"
+    # was percent-encoded as "%3F" and so slipped past our literal-"?" split)
+    # ending up attached to the domain.
+    if re.search(r"[\s?=&#/%]", domain):
+        return False
+    if domain.split(".")[0] == "example":  # example.<any TLD>, not just .com/.org/.net
+        return False
     if any(domain == d or domain.endswith("." + d) for d in EMAIL_BLOCKLIST_DOMAINS):
         return False
     if local.lower() in EMAIL_BLOCKLIST_LOCALPARTS:

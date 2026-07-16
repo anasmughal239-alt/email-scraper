@@ -96,6 +96,34 @@ class TestValidCandidate(unittest.TestCase):
         self.assertFalse(es.is_valid_candidate("u00a0@konfront.io"))
         self.assertTrue(es.is_valid_candidate("sales@konfront.io"))
 
+    def test_malformed_domain_with_query_string_blocked(self):
+        # Regression (lemonsqueezy.com): a mailto: href's "?subject=..."
+        # query string ended up attached to the domain instead of being
+        # stripped. is_valid_candidate now rejects any domain containing
+        # whitespace or URL-special characters, regardless of how it got
+        # there, rather than relying solely on the mailto-parsing split.
+        self.assertFalse(es.is_valid_candidate("hello@lemonsqueezy.com?subject=product tour request"))
+        self.assertTrue(es.is_valid_candidate("hello@lemonsqueezy.com"))
+
+    def test_example_any_tld_blocked(self):
+        # Regression (gatsbyjs.com): the blocklist only covered
+        # example.com/.org/.net explicitly, missing example.xyz and others.
+        for email in ["you@example.xyz", "a@example.io", "b@example.co"]:
+            with self.subTest(email=email):
+                self.assertFalse(es.is_valid_candidate(email))
+
+    def test_more_placeholder_domains_blocked(self):
+        # Found in a live 200-domain batch: laravel.com (Ada Lovelace,
+        # recurring placeholder person), grafana.com, copy.ai, hover.com,
+        # and vwo.com's multi-language "your company" placeholders.
+        for email in [
+            "ada@lovelace.com", "name@host.com", "name@website.com",
+            "jane@doe.net", "name@ihrefirma.com", "nombre@tuempresa.com",
+            "nome@suaempresa.com",
+        ]:
+            with self.subTest(email=email):
+                self.assertFalse(es.is_valid_candidate(email))
+
     def test_disposable_domains_blocked(self):
         for email in [
             "a@mailinator.com", "b@yopmail.com", "c@guerrillamail.com",
