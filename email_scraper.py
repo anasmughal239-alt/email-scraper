@@ -104,6 +104,10 @@ EMAIL_BLOCKLIST_DOMAINS = {
     "godaddy.com", "domain.com", "yourdomain.com", "yoursite.com", "yourbusiness.com",
     "schema.org", "w3.org", "adobe.com",
     "acme.com", "acmeinc.com",  # classic tutorial/placeholder company name
+    "company.com",  # extremely common placeholder in SaaS demo/marketing copy
+    "hostname.com",  # placeholder domain used in sysadmin/nginx-style tutorials
+    "mailinator.com",  # disposable email testing service, never a real contact
+    "encom.com",  # fictional company from Tron, common tech-demo placeholder
     "2x.png", "1x.png",  # guards against image-name false positives slipping through
 }
 EMAIL_BLOCKLIST_LOCALPARTS = {
@@ -421,7 +425,10 @@ def is_valid_candidate(email: str) -> bool:
         return False
     if local.lower() in EMAIL_BLOCKLIST_LOCALPARTS:
         return False
-    if domain.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")):
+    if domain.endswith((
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",  # images
+        ".mjs", ".js", ".css", ".map", ".json", ".wasm",   # JS/build asset filenames, e.g. house.js@0.0.<hash>.mjs
+    )):
         return False
     return True
 
