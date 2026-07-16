@@ -23,13 +23,10 @@ Works as a plain CLI script and as a Google Colab cell (see README.md).
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import gzip
-import io
 import random
 import re
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -70,6 +67,19 @@ CONTACT_KEYWORDS = [
     "contact", "contact-us", "contactus", "about", "about-us", "aboutus",
     "support", "help", "get-in-touch", "getintouch", "reach-us", "reach-out",
     "connect", "enquiry", "inquiry", "customer-service", "customer-support",
+    # Spanish
+    "contacto", "contactenos", "contactanos", "sobre-nosotros", "quienes-somos",
+    "soporte", "ayuda",
+    # French
+    "contactez-nous", "nous-contacter", "a-propos", "apropos", "assistance",
+    # German
+    "kontakt", "kontaktiere-uns", "ueber-uns", "uber-uns", "hilfe",
+    # Italian
+    "contatti", "chi-siamo", "assistenza",
+    # Portuguese
+    "contato", "fale-conosco", "sobre-nos", "suporte",
+    # Dutch
+    "neem-contact-op", "over-ons",
 ]
 
 # Unambiguous "this page is for contacting us" phrases — trustworthy at any
@@ -82,8 +92,21 @@ HARD_CONTACT_KEYWORDS = {
     "contact", "contact-us", "contactus", "about-us", "aboutus",
     "get-in-touch", "getintouch", "reach-us", "reach-out",
     "customer-service", "customer-support",
+    "contacto", "contactenos", "contactanos", "sobre-nosotros", "quienes-somos",
+    "contactez-nous", "nous-contacter", "a-propos", "apropos",
+    "kontakt", "kontaktiere-uns", "ueber-uns", "uber-uns",
+    "contatti", "chi-siamo",
+    "contato", "fale-conosco", "sobre-nos",
+    "neem-contact-op", "over-ons",
 }
 MAX_SOFT_MATCH_DEPTH = 2  # soft keywords only count on paths this shallow or less
+
+# NOTE ON LANGUAGE COVERAGE: the above covers Latin-script European languages,
+# which fit this scraper's path/token-matching approach. CJK, Arabic, and
+# other non-Latin-script sites are NOT covered — their URL slugs are often
+# percent-encoded or transliterated inconsistently, which this substring/token
+# approach can't reliably handle without a much larger rework (URL-decoding
+# every path, language-specific tokenization, etc.).
 
 # Path segments that mean "this is content ABOUT a topic", not a real contact
 # page — even though the page may otherwise score high on CONTACT_KEYWORDS
@@ -106,8 +129,14 @@ EMAIL_BLOCKLIST_DOMAINS = {
     "acme.com", "acmeinc.com",  # classic tutorial/placeholder company name
     "company.com",  # extremely common placeholder in SaaS demo/marketing copy
     "hostname.com",  # placeholder domain used in sysadmin/nginx-style tutorials
-    "mailinator.com",  # disposable email testing service, never a real contact
     "encom.com",  # fictional company from Tron, common tech-demo placeholder
+    "foo.com", "bar.com", "test.com", "placeholder.com", "notarealemail.com",
+    "noemail.com", "yourcompany.com", "mycompany.com", "email.com",
+    # Disposable/temporary email services — never a real long-term contact.
+    "mailinator.com", "guerrillamail.com", "10minutemail.com", "temp-mail.org",
+    "tempmail.com", "throwawaymail.com", "mailnesia.com", "trashmail.com",
+    "fakeinbox.com", "dispostable.com", "yopmail.com", "sharklasers.com",
+    "getnada.com", "maildrop.cc",
     "2x.png", "1x.png",  # guards against image-name false positives slipping through
 }
 EMAIL_BLOCKLIST_LOCALPARTS = {
@@ -133,25 +162,50 @@ OBFUSCATED_EMAIL_RE = re.compile(
 
 REQUEST_TIMEOUT = 12
 MAX_SITEMAP_DEPTH = 3
-MAX_PAGES_PER_DOMAIN = 6
+MAX_PAGES_PER_DOMAIN = 10
 # Large e-commerce/blog sites can have sitemap trees with thousands of child
 # files (per-locale, per-collection, per-year archives). Cap total sitemap
 # fetches per domain so one domain can't stall the whole batch.
-MAX_SITEMAP_FETCHES_PER_DOMAIN = 30
+MAX_SITEMAP_FETCHES_PER_DOMAIN = 50
+# Extra same-domain links tried when sitemap + footer both find nothing —
+# a shallow second hop rather than a full crawl, to catch contact pages
+# that aren't sitemap-listed and aren't linked from the footer specifically.
+MAX_SECOND_HOP_LINKS = 5
 
 
 # --------------------------------------------------------------------------
 # Data model
 # --------------------------------------------------------------------------
 
+def _brand_label(domain: str) -> str:
+    """The leading label of a domain, e.g. 'mozilla' from 'mozilla.org' or
+    'makenotion' from 'makenotion.com'. A crude stand-in for "company name"
+    without needing a public-suffix-list dependency."""
+    return domain.split(".")[0].lower()
+
+
 def email_matches_domain(email: str, bare_domain: str) -> bool:
-    """True if the email's domain is the target domain or a subdomain of it —
-    distinguishes the company's own contact address from a third party's
-    email incidentally mentioned on one of its pages (e.g. an integration
-    partner's support address on a marketplace listing)."""
+    """True if the email's domain is the target domain, a subdomain of it, or
+    plausibly the same company under a different TLD/brand domain — e.g.
+    mozilla.org's site with a mozilla.com email, or notion.so's site with a
+    makenotion.com email. Distinguishes the company's own contact address
+    from a third party's email incidentally mentioned on one of its pages
+    (e.g. an integration partner's support address on a marketplace listing)."""
     email_domain = email.rpartition("@")[2].lower()
     bare_domain = bare_domain.lower()
-    return email_domain == bare_domain or email_domain.endswith("." + bare_domain)
+    if email_domain == bare_domain or email_domain.endswith("." + bare_domain):
+        return True
+
+    # Conservative fuzzy fallback: only when both labels are long enough that
+    # a match isn't coincidental, and lengths are close enough that a short
+    # brand name isn't just happening to appear inside an unrelated longer
+    # domain (e.g. "linear" inside "linear-algebra-tutors").
+    email_label = _brand_label(email_domain)
+    bare_label = _brand_label(bare_domain)
+    shorter, longer = sorted([email_label, bare_label], key=len)
+    if len(shorter) >= 5 and len(longer) / len(shorter) <= 2.5 and shorter in longer:
+        return True
+    return False
 
 
 @dataclass
@@ -370,6 +424,35 @@ def find_contact_links_on_page(html: str, base_url: str) -> list:
         if any(kw in haystack for kw in CONTACT_KEYWORDS):
             links.append(urljoin(base_url, href))
     return list(dict.fromkeys(links))
+
+
+def find_second_hop_links(html: str, base_url: str, already_tried: set,
+                           limit: int = MAX_SECOND_HOP_LINKS) -> list:
+    """When sitemap discovery and keyword-based footer-link discovery both
+    come up empty, take a broader (but still shallow and bounded) look at
+    the homepage's other same-domain navigation links — e.g. a 'Team' or
+    'Locations' page that doesn't happen to contain any contact keyword."""
+    soup = BeautifulSoup(html, "html.parser")
+    base_domain = urlparse(base_url).netloc
+
+    candidates = []
+    seen = set(already_tried)
+    for a in soup.find_all("a", href=True):
+        full_url = urljoin(base_url, a["href"])
+        parsed = urlparse(full_url)
+        if parsed.netloc != base_domain or full_url in seen:
+            continue
+        path = parsed.path.lower()
+        segments, tokens = _path_tokens(path)
+        if tokens & NEGATIVE_PATH_KEYWORDS or DATED_PERMALINK_RE.search(path):
+            continue
+        if len(segments) > 2:  # stay shallow — nav links, not deep content
+            continue
+        seen.add(full_url)
+        candidates.append((len(segments), full_url))
+
+    candidates.sort(key=lambda t: t[0])
+    return [u for _, u in candidates[:limit]]
 
 
 # --------------------------------------------------------------------------
@@ -636,6 +719,20 @@ def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_m
             if found:
                 result.emails |= found
                 result.source_pages.add(page_url)
+
+        # Shallow second hop: sitemap + footer-keyword discovery both failed
+        # to surface anything useful, so try a few more same-domain nav links
+        # from the homepage before giving up or falling back to Playwright.
+        if not result.emails and result.method == "homepage-fallback" and home_resp:
+            for page_url in find_second_hop_links(home_resp.text, base_url, set(pages_to_check)):
+                resp = fetch(session, page_url)
+                time.sleep(delay)
+                if not resp:
+                    continue
+                found = extract_emails_from_html(resp.text)
+                if found:
+                    result.emails |= found
+                    result.source_pages.add(page_url)
 
         if not result.emails and use_playwright:
             playwright_fallback(result, base_url, pages_to_check, delay)
