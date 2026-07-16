@@ -212,6 +212,90 @@ def email_matches_domain(email: str, bare_domain: str) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------
+# Role classification: label each email by its local-part function and rank
+# them so the most useful outreach contact surfaces first.
+# --------------------------------------------------------------------------
+
+# Checked in insertion order; first matching role wins. Order also mirrors
+# ROLE_PRIORITY below (general/sales/support are the most useful for generic
+# outreach; press/careers/billing/legal are specialized).
+ROLE_KEYWORDS = {
+    "general": {"info", "hello", "hi", "hey", "contact", "contactus", "hola",
+                "enquiries", "enquiry", "inquiries", "inquiry", "mail", "office",
+                "general", "ask", "team", "reception", "admin"},
+    "sales": {"sales", "business", "bizdev", "biz", "partnerships", "partner",
+              "partners", "deals", "newbusiness", "reseller"},
+    "support": {"support", "help", "helpdesk", "care", "customercare",
+                "customerservice", "service", "success", "customersuccess",
+                "feedback"},
+    "press": {"press", "media", "pr", "news", "communications", "comms",
+              "publicity", "marketing"},
+    "careers": {"careers", "career", "jobs", "job", "hr", "recruiting",
+                "recruitment", "talent", "hiring", "work", "people", "apply"},
+    "billing": {"billing", "accounts", "accounting", "finance", "invoices",
+                "invoice", "payments", "payment", "orders"},
+    "legal": {"legal", "privacy", "dpo", "gdpr", "compliance", "abuse",
+              "security", "trust", "copyright", "dmca", "fraud", "coc", "conduct"},
+}
+
+# Lower number = higher priority (surfaced first / chosen as primary).
+ROLE_PRIORITY = {
+    "general": 0, "sales": 1, "support": 2, "personal": 3,
+    "press": 4, "careers": 5, "billing": 6, "legal": 7, "other": 8,
+}
+
+# Single-token local parts that are system/automated addresses, NOT people —
+# so a lone alpha token like these isn't mistaken for a first name.
+SYSTEM_LOCALPARTS = {
+    "webmaster", "postmaster", "hostmaster", "newsletter", "newsletters",
+    "notifications", "notification", "mailer", "daemon", "bounce", "bounces",
+    "root", "administrator", "automated", "system", "do-not-reply",
+}
+
+
+def classify_email_role(email: str) -> str:
+    """Label an email by the function of its local part, e.g.
+    info@x.com -> 'general', support@x.com -> 'support', jane.doe@x.com and
+    alex@x.com -> 'personal'. Returns 'other' when nothing matches."""
+    local = email.partition("@")[0].lower()
+    tokens = set(re.split(r"[._\-+]", local))
+    for role, keywords in ROLE_KEYWORDS.items():
+        if local in keywords or tokens & keywords:
+            return role
+    parts = [p for p in re.split(r"[._\-]", local) if p]
+    # firstname.lastname / firstname_lastname style -> an individual person.
+    if len(parts) >= 2 and all(p.isalpha() and len(p) >= 2 for p in parts[:2]):
+        return "personal"
+    # A single alpha-only token (no digits) is most likely a first name or
+    # vanity handle — treat as a person unless it's a known system address.
+    if len(parts) == 1 and parts[0].isalpha() and 2 <= len(parts[0]) <= 20 \
+            and parts[0] not in SYSTEM_LOCALPARTS:
+        return "personal"
+    return "other"
+
+
+def rank_emails_by_role(emails) -> list:
+    """Sort emails best-outreach-contact-first by role priority, tie-broken
+    alphabetically for stable output."""
+    return sorted(
+        emails,
+        key=lambda e: (ROLE_PRIORITY.get(classify_email_role(e), 99), e),
+    )
+
+
+def pick_primary_email(own_emails: list, other_emails: list) -> tuple:
+    """Choose the single best contact email (prefer the company's own domain
+    over third-party), returning (email, role) or ('', '')."""
+    ranked_own = rank_emails_by_role(own_emails)
+    ranked_other = rank_emails_by_role(other_emails)
+    best = (ranked_own or ranked_other)
+    if not best:
+        return "", ""
+    email = best[0]
+    return email, classify_email_role(email)
+
+
 @dataclass
 class DomainResult:
     input_url: str
@@ -825,6 +909,36 @@ def load_proxies(path: Optional[str]) -> Optional[list]:
     return proxies or None
 
 
+CSV_FIELDNAMES = [
+    "input_url", "domain", "primary_email", "primary_role",
+    "own_domain_emails", "other_domain_emails",
+    "method", "source_pages", "error",
+]
+
+
+def result_to_row(r: "DomainResult") -> dict:
+    """Turn a DomainResult into a flat output row: split own/other-domain
+    emails, rank each list by role, and pick the single best primary contact.
+    Shared by the CLI CSV writer and the Streamlit dashboard so both stay in
+    sync."""
+    own = [e for e in r.emails if email_matches_domain(e, r.domain)]
+    other = [e for e in r.emails if e not in own]
+    own_ranked = rank_emails_by_role(own)
+    other_ranked = rank_emails_by_role(other)
+    primary_email, primary_role = pick_primary_email(own_ranked, other_ranked)
+    return {
+        "input_url": r.input_url,
+        "domain": r.domain,
+        "primary_email": primary_email,
+        "primary_role": primary_role,
+        "own_domain_emails": "; ".join(own_ranked),
+        "other_domain_emails": "; ".join(other_ranked),
+        "method": r.method,
+        "source_pages": "; ".join(sorted(r.source_pages)),
+        "error": r.error,
+    }
+
+
 def run_batch(input_path: str, output_path: str, max_workers: int = 5, delay: float = 1.0,
               proxies_path: Optional[str] = None, verify_mx: bool = False,
               use_playwright: bool = False, respect_robots: bool = True) -> None:
@@ -844,12 +958,8 @@ def run_batch(input_path: str, output_path: str, max_workers: int = 5, delay: fl
                 "  playwright install chromium"
             )
 
-    fieldnames = [
-        "input_url", "domain", "own_domain_emails", "other_domain_emails",
-        "method", "source_pages", "error",
-    ]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         f.flush()
 
@@ -862,17 +972,7 @@ def run_batch(input_path: str, output_path: str, max_workers: int = 5, delay: fl
             done_count = 0
             for future in as_completed(futures):
                 r = future.result()
-                own = {e for e in r.emails if email_matches_domain(e, r.domain)}
-                other = r.emails - own
-                writer.writerow({
-                    "input_url": r.input_url,
-                    "domain": r.domain,
-                    "own_domain_emails": "; ".join(sorted(own)),
-                    "other_domain_emails": "; ".join(sorted(other)),
-                    "method": r.method,
-                    "source_pages": "; ".join(sorted(r.source_pages)),
-                    "error": r.error,
-                })
+                writer.writerow(result_to_row(r))
                 f.flush()
                 done_count += 1
                 status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")

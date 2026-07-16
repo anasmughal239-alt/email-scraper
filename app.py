@@ -97,17 +97,7 @@ if run_clicked:
         }
         for done, future in enumerate(as_completed(futures), start=1):
             r = future.result()
-            own = sorted({e for e in r.emails if es.email_matches_domain(e, r.domain)})
-            other = sorted(r.emails - set(own))
-            rows.append({
-                "input_url": r.input_url,
-                "domain": r.domain,
-                "own_domain_emails": "; ".join(own),
-                "other_domain_emails": "; ".join(other),
-                "method": r.method,
-                "source_pages": "; ".join(sorted(r.source_pages)),
-                "error": r.error,
-            })
+            rows.append(es.result_to_row(r))
 
             progress_bar.progress(done / total)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")

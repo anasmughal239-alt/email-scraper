@@ -41,7 +41,18 @@ Options:
 | `--use-playwright` | off | retry with headless Chromium when a domain's static fetch finds zero emails (needs `playwright`, see below) |
 | `--ignore-robots` | off (robots honored) | do **not** honor `robots.txt` Disallow rules — only for sites you own or have permission to crawl |
 
-Output CSV columns: `input_url, domain, own_domain_emails, other_domain_emails, method, source_pages, error`.
+Output CSV columns: `input_url, domain, primary_email, primary_role, own_domain_emails, other_domain_emails, method, source_pages, error`.
+
+### Role-based ranking
+
+Each email is classified by the function of its local part —
+`general` (info@, hello@, contact@), `sales`, `support`, `personal`
+(a named individual like jane.doe@ or alex@), `press`, `careers`,
+`billing`, `legal`, or `other` — and the email lists are sorted
+best-outreach-contact-first using that classification. The
+`primary_email`/`primary_role` columns give the single best contact to
+use per domain (preferring the company's own domain over any third-party
+address), so you don't have to eyeball a flat list.
 
 ## Running the tests
 

@@ -174,6 +174,55 @@ class TestEmailMatchesDomain(unittest.TestCase):
         self.assertFalse(es.email_matches_domain("random@totally-different.com", "shopify.com"))
 
 
+class TestRoleClassification(unittest.TestCase):
+    def test_role_labels(self):
+        cases = {
+            "info@x.com": "general",
+            "hello@x.com": "general",
+            "sales@x.com": "sales",
+            "partnerships@x.com": "sales",
+            "support@x.com": "support",
+            "help@x.com": "support",
+            "press@x.com": "press",
+            "careers@x.com": "careers",
+            "billing@x.com": "billing",
+            "legal@x.com": "legal",
+            "abuse@x.com": "legal",
+            "jane.doe@x.com": "personal",
+            "john_smith@x.com": "personal",
+            "alex@x.com": "personal",       # single first name
+            "patrick@x.com": "personal",
+            "webmaster@x.com": "other",     # single token but a system address
+            "postmaster@x.com": "other",
+            "xq7z@x.com": "other",          # has a digit -> not a name
+        }
+        for email, expected in cases.items():
+            with self.subTest(email=email):
+                self.assertEqual(es.classify_email_role(email), expected)
+
+    def test_ranking_orders_general_first(self):
+        emails = ["legal@x.com", "support@x.com", "info@x.com", "sales@x.com"]
+        ranked = es.rank_emails_by_role(emails)
+        self.assertEqual(ranked[0], "info@x.com")   # general wins
+        self.assertEqual(ranked[-1], "legal@x.com")  # legal last
+
+    def test_pick_primary_prefers_own_domain(self):
+        own = ["support@x.com"]
+        other = ["info@partner.com"]  # 'general' outranks 'support' by role,
+        # but own-domain must still be preferred over a third-party address.
+        email, role = es.pick_primary_email(own, other)
+        self.assertEqual(email, "support@x.com")
+        self.assertEqual(role, "support")
+
+    def test_pick_primary_falls_back_to_other(self):
+        email, role = es.pick_primary_email([], ["hello@partner.com"])
+        self.assertEqual(email, "hello@partner.com")
+        self.assertEqual(role, "general")
+
+    def test_pick_primary_empty(self):
+        self.assertEqual(es.pick_primary_email([], []), ("", ""))
+
+
 class TestRobotsPolicy(unittest.TestCase):
     def _policy(self, body, enabled=True):
         parser = robotparser.RobotFileParser()
