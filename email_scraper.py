@@ -472,10 +472,16 @@ def domain_has_mx(domain: str) -> bool:
         return _dns_cache[domain]
     try:
         import dns.resolver  # type: ignore
+    except ImportError:
+        _dns_cache[domain] = True  # dnspython not installed -> skip the check, don't discard
+        return True
+    try:
         answers = dns.resolver.resolve(domain, "MX", lifetime=5)
         result = len(answers) > 0
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        result = False  # domain doesn't exist or genuinely has no mail server
     except Exception:
-        result = True  # dnspython missing or lookup failed -> don't discard, just skip check
+        result = True  # transient/network error on our end -> don't punish the email for it
     _dns_cache[domain] = result
     return result
 
