@@ -83,9 +83,18 @@ class TestValidCandidate(unittest.TestCase):
         for email in [
             "a@example.com", "b@company.com", "c@hostname.com",
             "d@acme.com", "e@encom.com", "f@yourcompany.com", "g@test.com",
+            "you@mail.com",       # classic HTML placeholder text
+            "beispiel@email.de",  # German "example@" placeholder pattern
         ]:
             with self.subTest(email=email):
                 self.assertFalse(es.is_valid_candidate(email))
+
+    def test_escaped_unicode_localpart_blocked(self):
+        # Regression: a JS-escaped non-breaking space rendered as "u00a0"
+        # (no backslash) leaked into a whole local part outside a <script>
+        # tag, same bug family as the earlier Shopify "u003e" prefix leak.
+        self.assertFalse(es.is_valid_candidate("u00a0@konfront.io"))
+        self.assertTrue(es.is_valid_candidate("sales@konfront.io"))
 
     def test_disposable_domains_blocked(self):
         for email in [
@@ -172,6 +181,20 @@ class TestEmailMatchesDomain(unittest.TestCase):
 
     def test_unrelated(self):
         self.assertFalse(es.email_matches_domain("random@totally-different.com", "shopify.com"))
+
+    def test_prefix_product_suite_domains(self):
+        # Regression: zoho.com's own product-suite domains (zohocorp.com,
+        # zohoinvoice.com, etc.) were missed because "zoho" is only 4 chars,
+        # below the ratio rule's 5-char minimum. The hyphen-free prefix rule
+        # should catch all of these without reopening the guard above (that
+        # false match has a hyphen right at the join; these don't).
+        for email in [
+            "sales@zohocorp.com", "support@zohobilling.com", "support@zohobooks.com",
+            "support@zohoinventory.com", "support@zohoexpense.com",
+            "support@zohofinanceplus.com", "support@zohoinvoice.com",
+        ]:
+            with self.subTest(email=email):
+                self.assertTrue(es.email_matches_domain(email, "zoho.com"))
 
 
 class TestRoleClassification(unittest.TestCase):

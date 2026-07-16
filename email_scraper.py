@@ -133,6 +133,8 @@ EMAIL_BLOCKLIST_DOMAINS = {
     "encom.com",  # fictional company from Tron, common tech-demo placeholder
     "foo.com", "bar.com", "test.com", "placeholder.com", "notarealemail.com",
     "noemail.com", "yourcompany.com", "mycompany.com", "email.com",
+    "mail.com",  # classic HTML placeholder text, e.g. <input placeholder="you@mail.com">
+    "email.de",  # German equivalent placeholder domain (paired with "beispiel" = "example")
     # Disposable/temporary email services — never a real long-term contact.
     "mailinator.com", "guerrillamail.com", "10minutemail.com", "temp-mail.org",
     "tempmail.com", "throwawaymail.com", "mailnesia.com", "trashmail.com",
@@ -144,7 +146,13 @@ EMAIL_BLOCKLIST_LOCALPARTS = {
     "no-reply", "noreply", "donotreply", "test", "example",
     "youremail", "email", "yourname",
     "john.appleseed", "jane.appleseed", "john.doe", "jane.doe",
+    "beispiel",  # German for "example" — placeholder-form pattern
 }
+# Matches a whole local part that is just a rendered-without-backslash JS
+# unicode escape (e.g. a non-breaking space) leaking outside a <script>
+# tag we'd otherwise strip — same bug category as the earlier Shopify
+# "u003e" prefix leak, just as a whole local part instead of a prefix.
+ESCAPED_UNICODE_LOCALPART_RE = re.compile(r"^u[0-9a-f]{4}$", re.IGNORECASE)
 # Retina-asset filenames often mistaken for emails, e.g. logo@2x.png,
 # icon@3x.webm — the "@Nx." convention applies to any asset type, so match
 # on the convention itself rather than a fixed extension list.
@@ -209,6 +217,17 @@ def email_matches_domain(email: str, bare_domain: str) -> bool:
     shorter, longer = sorted([email_label, bare_label], key=len)
     if len(shorter) >= 5 and len(longer) / len(shorter) <= 2.5 and shorter in longer:
         return True
+    # Prefix-specific case: catches short brand names with a product-suite
+    # suffix (zoho.com site, zohocorp.com/zohoinvoice.com/zohobilling.com
+    # emails) that the ratio rule's 5-char minimum would otherwise miss.
+    # The suffix must be hyphen-free — a real sub-brand/product suffix is a
+    # single compact word (invoice, billing, financeplus); the false-match
+    # case ("linear" inside "linear-algebra-tutors") has a hyphen right at
+    # the join, which this rejects regardless of length.
+    if len(shorter) >= 4 and longer.startswith(shorter):
+        remainder = longer[len(shorter):]
+        if remainder and "-" not in remainder and len(remainder) <= 15:
+            return True
     return False
 
 
@@ -635,6 +654,8 @@ def is_valid_candidate(email: str) -> bool:
         return False
     if local.lower() in EMAIL_BLOCKLIST_LOCALPARTS:
         return False
+    if ESCAPED_UNICODE_LOCALPART_RE.match(local):
+        return False
     if domain.endswith((
         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",  # images
         ".mjs", ".js", ".css", ".map", ".json", ".wasm",   # JS/build asset filenames, e.g. house.js@0.0.<hash>.mjs
@@ -976,7 +997,7 @@ def run_batch(input_path: str, output_path: str, max_workers: int = 5, delay: fl
                 f.flush()
                 done_count += 1
                 status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
-                print(f"[{done_count}/{len(domains)}] {r.domain or r.input_url}: {status}")
+                print(f"[{done_count}/{len(domains)}] {r.domain or r.input_url}: {status}", flush=True)
 
 
 # --------------------------------------------------------------------------
