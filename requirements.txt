@@ -1,0 +1,12 @@
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.2
+dnspython>=2.6
+
+# Needed for the Streamlit dashboard (app.py):
+streamlit>=1.35
+pandas>=2.2
+
+# Optional, only needed for --use-playwright (JS-rendered footer fallback):
+#   pip install playwright
+#   playwright install chromium

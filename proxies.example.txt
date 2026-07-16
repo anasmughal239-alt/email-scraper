@@ -1,0 +1,9 @@
+# One proxy URL per line, e.g.:
+# http://user:pass@host:port
+# http://host:port
+#
+# NOTE: free datacenter proxy lists are usually already blacklisted by
+# anti-bot systems and die within hours. They will cause MORE failures
+# than they prevent. Prefer leaving --proxies unset and relying on the
+# built-in rate limiting / retry / User-Agent rotation instead. Only use
+# this if you have a paid rotating proxy endpoint.

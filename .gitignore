@@ -1,0 +1,6 @@
+results.csv
+domains.txt
+proxies.txt
+__pycache__/
+*.pyc
+.venv/
