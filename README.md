@@ -184,9 +184,16 @@ without tying up your own machine.
   panel below the settings — it re-checks every proxy in the sidebar's
   Proxies box on a timer (default every 30s, configurable) by fetching a
   lightweight IP-echo endpoint through each one, and shows alive/dead,
-  latency, and the egress IP each proxy actually reports. This is purely a
-  monitoring panel: dead proxies aren't automatically excluded from
-  scraping rotation yet, they're just visible.
+  latency, and the egress IP each proxy actually reports. Dead proxies are
+  also automatically skipped by the actual scraper run itself (a fresh
+  health check runs right before a batch starts), not just flagged in the
+  panel.
+- **Proxy persistence.** The Proxies box is normally per-browser-session —
+  a page reload loses whatever was pasted in. Set a `SCRAPER_PROXIES`
+  environment variable (comma- or newline-separated proxy URLs) on your
+  host (e.g. Railway's Variables tab) to pre-fill it automatically on every
+  new session, without ever putting real credentials in this repo. It's
+  still editable/overridable in the box itself for a one-off session.
 - **JavaScript-rendered footers** are handled by the optional `--use-playwright`
   / `use_playwright=True` fallback (see above). It's opt-in and only triggers
   per-domain when the static pass finds nothing, since it's much slower.

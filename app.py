@@ -10,6 +10,7 @@ Deploy free:   push this folder to a GitHub repo, connect it at
 """
 
 import asyncio
+import os
 import time
 
 import pandas as pd
@@ -26,6 +27,19 @@ st.caption(
 
 if "results" not in st.session_state:
     st.session_state.results = []
+
+# Pre-fills the Proxies box from an env var on first load of a new browser
+# session (a page reload otherwise loses whatever was pasted in, since that
+# textarea's value only lives in Streamlit's session_state, not on disk).
+# Set SCRAPER_PROXIES in Railway's Variables tab (comma- or newline-
+# separated) — never hardcode real proxy credentials into this file, since
+# it's committed to a public repo. Still editable/overridable per-session
+# in the box itself; this only seeds the initial value.
+if "proxies_text" not in st.session_state:
+    _default_proxies_env = os.environ.get("SCRAPER_PROXIES", "")
+    st.session_state.proxies_text = "\n".join(
+        p.strip() for p in _default_proxies_env.replace(",", "\n").splitlines() if p.strip()
+    )
 
 with st.sidebar:
     st.header("Settings")
@@ -62,7 +76,9 @@ with st.sidebar:
         "Proxies (optional, one per line)", height=80, key="proxies_text",
         placeholder="http://user:pass@host:port",
         help="Free datacenter proxy lists are usually already blacklisted and won't help much. "
-             "Leave empty unless you have a paid rotating endpoint.",
+             "Leave empty unless you have a paid rotating endpoint. Pre-filled from the "
+             "SCRAPER_PROXIES environment variable if set — edit here to override for just "
+             "this session.",
     )
     health_check_interval = st.selectbox(
         "Proxy health check interval", [15, 30, 60, 120], index=1,
