@@ -1,6 +1,7 @@
 results.csv
 domains.txt
 proxies.txt
+retry_list.txt
 runs/
 __pycache__/
 *.pyc
