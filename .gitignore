@@ -1,6 +1,7 @@
 results.csv
 domains.txt
 proxies.txt
+runs/
 __pycache__/
 *.pyc
 .venv/

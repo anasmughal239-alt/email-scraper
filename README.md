@@ -194,6 +194,18 @@ without tying up your own machine.
   host (e.g. Railway's Variables tab) to pre-fill it automatically on every
   new session, without ever putting real credentials in this repo. It's
   still editable/overridable in the box itself for a one-off session.
+- **Streaming results + resume (dashboard).** Each domain's result is
+  written to a per-job CSV under `runs/` (path derived from a hash of the
+  domain list) and flushed as soon as it completes — so an interrupted run
+  (browser disconnect, laptop sleep, Streamlit rerun, container hiccup)
+  loses nothing. Re-running the same list picks up where it left off,
+  skipping domains already saved and appending the rest; tick **Start
+  fresh** to discard that progress and rescrape. Only a small rolling
+  window of recent rows is held in memory during a run, so memory and
+  render time stay flat even across thousands of domains — this is what
+  makes a single large (e.g. 2000+ domain) job safe. `runs/` is gitignored;
+  note it's ephemeral across a full Railway redeploy, so download the CSV
+  once a big job finishes.
 - **JavaScript-rendered footers** are handled by the optional `--use-playwright`
   / `use_playwright=True` fallback (see above). It's opt-in and only triggers
   per-domain when the static pass finds nothing, since it's much slower.
