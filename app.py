@@ -150,6 +150,17 @@ if run_clicked:
         st.warning("Enter at least one domain.")
         st.stop()
 
+    if proxies:
+        original_count = len(proxies)
+        with st.spinner("Checking proxy health before starting..."):
+            proxies, dead_count = asyncio.run(es.filter_alive_proxies(proxies))
+        if dead_count == original_count:
+            st.warning(f"All {original_count} proxies failed the health check — using them anyway "
+                       "since there's no healthy fallback (expect connection errors).")
+        elif dead_count:
+            st.info(f"{dead_count} of {original_count} proxies failed the health check "
+                    "and will be skipped for this run.")
+
     if use_playwright:
         try:
             import playwright.async_api  # noqa: F401
