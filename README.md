@@ -25,7 +25,7 @@ Finds public contact emails for a list of websites by:
 ```bash
 pip install -r requirements.txt
 cp domains.example.txt domains.txt   # add your real list, one URL/domain per line
-python email_scraper.py --input domains.txt --output results.csv --workers 5 --delay 1.0
+python email_scraper.py --input domains.txt --output results.csv --workers 10 --delay 0.3
 ```
 
 Options:
@@ -34,12 +34,13 @@ Options:
 |---|---|---|
 | `--input, -i` | required | file with one URL/domain per line |
 | `--output, -o` | `results.csv` | output CSV path |
-| `--workers, -w` | `5` | domains processed concurrently |
-| `--delay, -d` | `1.0` | seconds between page fetches *within* a domain (politeness) |
+| `--workers, -w` | `10` | domains processed concurrently. Bounded by asyncio tasks, not OS threads, so this can reasonably go well past 10-20 if your host has the bandwidth/connections to match |
+| `--delay, -d` | `0.3` | seconds to stagger page-fetch starts *within* a domain (politeness) |
 | `--proxies, -p` | none | optional file of proxy URLs, one per line |
 | `--verify-mx` | off | drop emails whose domain has no MX record (needs `dnspython`) |
 | `--use-playwright` | off | retry with headless Chromium when a domain's static fetch finds zero emails (needs `playwright`, see below) |
 | `--ignore-robots` | off (robots honored) | do **not** honor `robots.txt` Disallow rules — only for sites you own or have permission to crawl |
+| `--resume` | off | if `--output` already has rows from a previous (e.g. interrupted) run, skip domains already recorded in it and append new results instead of overwriting the file |
 
 Output CSV columns: `input_url, domain, primary_email, primary_role, own_domain_emails, other_domain_emails, method, source_pages, error`.
 

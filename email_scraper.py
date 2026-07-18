@@ -32,6 +32,7 @@ import asyncio
 import concurrent.futures
 import csv
 import gzip
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -623,10 +624,25 @@ async def discover_all_page_urls(session: aiohttp.ClientSession, base_url: str,
         results = await asyncio.gather(*(_bounded_fetch(u) for u in wave))
         next_frontier: list = []
         for children, pages in results:
+            # The cap above only stopped a new *wave* from starting once
+            # exceeded — a single file within an already-started wave (e.g.
+            # figma.com's real 367,890-URL community index) still added its
+            # entire contents before the check ran again. Truncating each
+            # file's own contribution to the remaining budget, right as it's
+            # merged, means one huge file can no longer blow past the cap by
+            # itself — the fetch/parse of that one file still costs what it
+            # costs, but its result can't inflate all_pages/downstream work
+            # (dedup, rank_contact_urls) past MAX_TOTAL_SITEMAP_PAGES.
             if pages:
-                all_pages.extend(pages)
-                page_count += len(pages)
-            if depth < MAX_SITEMAP_DEPTH:
+                remaining_budget = MAX_TOTAL_SITEMAP_PAGES - page_count
+                if remaining_budget <= 0:
+                    pages = []
+                elif len(pages) > remaining_budget:
+                    pages = pages[:remaining_budget]
+                if pages:
+                    all_pages.extend(pages)
+                    page_count += len(pages)
+            if depth < MAX_SITEMAP_DEPTH and page_count < MAX_TOTAL_SITEMAP_PAGES:
                 next_frontier.extend(c for c in children if c not in seen)
 
         frontier = list(dict.fromkeys(next_frontier))
@@ -1139,6 +1155,20 @@ def load_proxies(path: Optional[str]) -> Optional[list]:
     return proxies or None
 
 
+def _load_completed_input_urls(output_path: str) -> set:
+    """Reads whatever input_urls already have a row in an existing output
+    CSV, so --resume can skip them rather than re-scraping from scratch.
+    Any row present (including a "no emails found" or "gave up after ...s"
+    error result) counts as done — those are ordinary terminal outcomes,
+    not signs of an interrupted run, exactly like a normal (non-resumed)
+    batch never retries them either."""
+    if not os.path.exists(output_path):
+        return set()
+    with open(output_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return {row["input_url"] for row in reader if row.get("input_url")}
+
+
 CSV_FIELDNAMES = [
     "input_url", "domain", "primary_email", "primary_role",
     "own_domain_emails", "other_domain_emails",
@@ -1252,17 +1282,31 @@ def _check_playwright_installed() -> None:
 
 async def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
                      proxies_path: Optional[str] = None, verify_mx: bool = False,
-                     use_playwright: bool = False, respect_robots: bool = True) -> None:
+                     use_playwright: bool = False, respect_robots: bool = True,
+                     resume: bool = False) -> None:
     domains = load_domains(input_path)
     proxies = load_proxies(proxies_path)
 
     if use_playwright:
         _check_playwright_installed()
 
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
+    file_mode = "w"
+    write_header = True
+    if resume:
+        already_done = _load_completed_input_urls(output_path)
+        if already_done:
+            remaining = [d for d in domains if d not in already_done]
+            print(f"Resuming: {len(already_done)} domain(s) already in {output_path}, "
+                  f"{len(remaining)} remaining.", flush=True)
+            domains = remaining
+            file_mode = "a"
+            write_header = False
+
+    with open(output_path, file_mode, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
-        writer.writeheader()
-        f.flush()
+        if write_header:
+            writer.writeheader()
+            f.flush()
 
         async for done_count, total, r in process_domains_streaming(
             domains, max_workers, delay, proxies, verify_mx, use_playwright, respect_robots
@@ -1281,7 +1325,10 @@ def main():
     parser = argparse.ArgumentParser(description="Sitemap-aware contact email scraper")
     parser.add_argument("--input", "-i", required=True, help="Path to file with one URL/domain per line")
     parser.add_argument("--output", "-o", default="results.csv", help="Path to output CSV")
-    parser.add_argument("--workers", "-w", type=int, default=10, help="Concurrent domains to process")
+    parser.add_argument("--workers", "-w", type=int, default=10,
+                         help="Concurrent domains to process. Bounded by asyncio tasks, not OS "
+                              "threads, so this can reasonably go well past 10-20 if your host "
+                              "has the bandwidth/connections to match.")
     parser.add_argument("--delay", "-d", type=float, default=0.3, help="Seconds to stagger page-fetch starts within a domain")
     parser.add_argument("--proxies", "-p", default=None, help="Optional path to a file of proxy URLs, one per line")
     parser.add_argument("--verify-mx", action="store_true", help="Drop emails whose domain has no MX record (requires dnspython)")
@@ -1291,6 +1338,10 @@ def main():
     parser.add_argument("--ignore-robots", action="store_true",
                          help="Do NOT honor robots.txt Disallow rules (default: honored). "
                               "Only use on sites you own or have permission to crawl.")
+    parser.add_argument("--resume", action="store_true",
+                         help="If --output already has rows from a previous (e.g. interrupted) "
+                              "run, skip domains already recorded in it and append new results "
+                              "instead of overwriting the file.")
     args = parser.parse_args()
 
     asyncio.run(run_batch(
@@ -1302,6 +1353,7 @@ def main():
         verify_mx=args.verify_mx,
         use_playwright=args.use_playwright,
         respect_robots=not args.ignore_robots,
+        resume=args.resume,
     ))
 
 

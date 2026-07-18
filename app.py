@@ -29,7 +29,13 @@ if "results" not in st.session_state:
 
 with st.sidebar:
     st.header("Settings")
-    workers = st.slider("Concurrent domains", 1, 20, 10)
+    workers = st.slider(
+        "Concurrent domains", 1, 50, 10,
+        help="Bounded by asyncio tasks now, not OS threads, so this can go "
+             "meaningfully higher than the old threaded version could — "
+             "pushing it up is mostly a free speed win as long as your host "
+             "has the outbound bandwidth/connections to match.",
+    )
     delay = st.slider(
         "Page-fetch stagger (s)", 0.0, 3.0, 0.3, 0.1,
         help="Pages within one domain are fetched concurrently, not one at a time. "
