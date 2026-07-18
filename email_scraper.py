@@ -17,29 +17,32 @@ Pipeline per input URL:
   7. Filter out placeholder/tracking/false-positive addresses.
   8. Write results to CSV incrementally (crash/disconnect-safe).
 
+Concurrency is asyncio/aiohttp-based throughout: fetching, sitemap discovery,
+and per-domain batching. This lets a stuck domain (DNS/TLS-level stall) be
+genuinely cancelled via asyncio.wait_for, rather than merely stopped-watching
+the way a stuck OS thread would have to be.
+
 Works as a plain CLI script and as a Google Colab cell (see README.md).
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import concurrent.futures
 import csv
 import gzip
 import random
 import re
-import threading
-import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import AsyncIterator, Optional
 from urllib import robotparser
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
-import requests
+import aiohttp
+from aiohttp.resolver import ThreadedResolver
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # --------------------------------------------------------------------------
 # Config / constants
@@ -182,15 +185,16 @@ REQUEST_TIMEOUT = 12
 # full REQUEST_TIMEOUT (x up to 3 attempts with retries) before deciding
 # whether it's even worth trying the 7 guessed sitemap paths.
 FAST_FAIL_PROBE_TIMEOUT = 6
-# Hard ceiling on how long a single domain's worker thread may run before
-# a batch gives up on it. Found via a real hang: artstation.com's thread
-# ran 5+ minutes with zero CPU activity — well past what our own per-request
-# timeouts (REQUEST_TIMEOUT x retries) should ever allow — pointing to a
-# DNS/TLS-level stall outside requests' timeout coverage. Without this, one
-# such domain blocks an entire batch indefinitely, even with everything
-# else already done. Python cannot forcibly kill a stuck thread, so the
-# abandoned worker may keep running in the background, but this stops it
-# from blocking the batch's visible progress, CSV output, or completion.
+# Hard ceiling on how long a single domain's processing may run before a
+# batch gives up on it. Found via a real hang: artstation.com ran 5+ minutes
+# with zero CPU activity — well past what our own per-request timeouts
+# (REQUEST_TIMEOUT x retries) should ever allow — pointing to a DNS/TLS-level
+# stall outside aiohttp's own timeout coverage. Without this, one such
+# domain blocks an entire batch indefinitely, even with everything else
+# already done. Enforced via asyncio.wait_for, which genuinely cancels the
+# stuck coroutine at the next await point (unlike an OS thread, which can't
+# be forcibly killed) — so the abandoned domain's task actually stops
+# rather than merely being ignored.
 DOMAIN_HARD_TIMEOUT_SECONDS = 180
 MAX_SITEMAP_DEPTH = 3
 MAX_PAGES_PER_DOMAIN = 10
@@ -214,9 +218,9 @@ MAX_TOTAL_SITEMAP_PAGES = 20000
 # Sitemap *files* used to be fetched one at a time, recursively — a sitemap
 # index with many locale/category children (fastly.com's tree needed ~50
 # files to assemble its 5525 pages) took as long as the SUM of every file
-# fetch. This bounds how many sitemap-file fetches run concurrently via a
-# shared work-queue (BFS), so the same tree takes roughly as long as its
-# slowest single fetch instead.
+# fetch. This bounds how many sitemap-file fetches run concurrently via an
+# asyncio.Semaphore over one "wave" of URLs at a time, so the same tree
+# takes roughly as long as its slowest single fetch instead.
 SITEMAP_FETCH_WORKERS = 6
 # Extra same-domain links tried when sitemap + footer both find nothing —
 # a shallow second hop rather than a full crawl, to catch contact pages
@@ -372,45 +376,80 @@ class DomainResult:
 
 
 # --------------------------------------------------------------------------
-# HTTP session helpers
+# HTTP fetch helpers (aiohttp-based)
 # --------------------------------------------------------------------------
 
-def build_session(proxies: Optional[list] = None) -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=1.2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    if proxies:
-        proxy = random.choice(proxies)
-        session.proxies.update({"http": proxy, "https": proxy})
-    return session
+@dataclass
+class _FetchResponse:
+    text: str
+    content: bytes
 
 
-def fetch(session: requests.Session, url: str, timeout: int = REQUEST_TIMEOUT) -> Optional[requests.Response]:
+async def _run_cpu(func, *args):
+    """Runs a CPU-bound, pure-Python parse (sitemap XML, BeautifulSoup HTML)
+    in the default executor thread pool instead of the event loop itself.
+    Without this, a single expensive parse — e.g. figma.com's real
+    367,890-entry sitemap file — blocks the *shared* event loop for the
+    whole parse, stalling every other concurrently-processing domain's
+    timers and socket reads along with it (an OS-thread-per-domain model
+    doesn't have this failure mode, since each thread's CPU work only ever
+    blocked that one thread). Found via a real regression: several
+    unrelated domains falsely reported "unreachable" in the same batch
+    that hit figma.com's giant sitemap, because their short probe timeouts
+    fired while the loop was stuck parsing XML for a different domain."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+
+def _new_connector() -> aiohttp.TCPConnector:
+    """Explicitly force aiohttp's plain ThreadedResolver (a background-thread
+    wrapper around socket.getaddrinfo) instead of letting aiohttp
+    auto-select AsyncResolver whenever the optional 'aiodns' package happens
+    to be installed. aiodns's c-ares resolver failed outright on this
+    project's Windows dev machine (ClientConnectorDNSError: "Could not
+    contact DNS servers") even though the same lookups work fine via plain
+    socket.getaddrinfo — a known aiohttp+aiodns+Windows footgun. Forcing
+    ThreadedResolver keeps behavior identical and reliable across platforms
+    rather than depending on which optional packages happen to be present."""
+    return aiohttp.TCPConnector(resolver=ThreadedResolver())
+
+
+async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = REQUEST_TIMEOUT,
+                 proxy: Optional[str] = None) -> Optional[_FetchResponse]:
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    try:
-        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        if resp.status_code == 200:
-            return resp
-    except requests.RequestException:
-        return None
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    attempts = 3  # 1 initial try + 2 retries, matching the old urllib3 Retry(total=2, ...)
+    for attempt in range(attempts):
+        try:
+            async with session.get(url, headers=headers, timeout=client_timeout,
+                                    allow_redirects=True, proxy=proxy) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    try:
+                        text = content.decode(resp.charset or "utf-8", errors="replace")
+                    except (LookupError, UnicodeDecodeError):
+                        text = content.decode("utf-8", errors="replace")
+                    return _FetchResponse(text=text, content=content)
+                if resp.status in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                    await asyncio.sleep(1.2 * (attempt + 1))
+                    continue
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt < attempts - 1:
+                await asyncio.sleep(1.2 * (attempt + 1))
+                continue
+            return None
     return None
 
 
-def probe_domain_reachable(base_url: str) -> bool:
+async def probe_domain_reachable(base_url: str, proxy: Optional[str] = None) -> bool:
     """Quick, short-timeout connectivity check, used to skip a dead/blocked
     domain fast instead of paying for a full robots.txt fetch plus up to 7
-    guessed sitemap paths — each through the main session's retry-with-
+    guessed sitemap paths — each through the main fetch()'s retry-with-
     backoff logic — before discovering the same thing. A site that responds
     at all (even with an error status like 403) counts as reachable, since
     error responses return immediately without retries; it's a fully failed
@@ -423,16 +462,14 @@ def probe_domain_reachable(base_url: str) -> bool:
     not a dead site). Worst case for a genuinely dead domain is now
     2x FAST_FAIL_PROBE_TIMEOUT instead of 1x, still far cheaper than the
     multi-attempt path it's replacing."""
+    timeout = aiohttp.ClientTimeout(total=FAST_FAIL_PROBE_TIMEOUT)
     for _ in range(2):
         try:
-            requests.get(
-                base_url,
-                headers={"User-Agent": random.choice(USER_AGENTS)},
-                timeout=FAST_FAIL_PROBE_TIMEOUT,
-                allow_redirects=True,
-            )
-            return True
-        except requests.RequestException:
+            async with aiohttp.ClientSession(timeout=timeout, connector=_new_connector()) as session:
+                async with session.get(base_url, headers={"User-Agent": random.choice(USER_AGENTS)},
+                                        allow_redirects=True, proxy=proxy):
+                    return True
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             continue
     return False
 
@@ -481,12 +518,13 @@ class RobotsPolicy:
             return True  # never let a robotparser quirk block the whole run
 
 
-def fetch_robots_policy(session: requests.Session, base_url: str, respect_robots: bool = True) -> RobotsPolicy:
+async def fetch_robots_policy(session: aiohttp.ClientSession, base_url: str,
+                               proxy: Optional[str] = None, respect_robots: bool = True) -> RobotsPolicy:
     """Fetch and parse robots.txt once. Extracts both the Disallow rules
     (for can_fetch checks) and the declared Sitemap: URLs. A missing or
     unreadable robots.txt fails open (allow all) — the conventional
     behaviour for a well-behaved but functional crawler."""
-    resp = fetch(session, urljoin(base_url, "/robots.txt"))
+    resp = await fetch(session, urljoin(base_url, "/robots.txt"), proxy=proxy)
     if not resp:
         return RobotsPolicy(None, [], enabled=respect_robots)
 
@@ -531,11 +569,12 @@ def parse_sitemap_xml(raw_bytes: bytes) -> tuple:
     return child_sitemaps, page_urls
 
 
-def _fetch_one_sitemap(session: requests.Session, sitemap_url: str) -> tuple:
+async def _fetch_one_sitemap(session: aiohttp.ClientSession, sitemap_url: str,
+                              proxy: Optional[str] = None) -> tuple:
     """Fetches and parses a single sitemap file. Returns (child_sitemap_urls,
     page_urls) — no recursion, no shared state; the caller (discover_all_page_urls)
     owns the BFS traversal and bookkeeping."""
-    resp = fetch(session, sitemap_url)
+    resp = await fetch(session, sitemap_url, proxy=proxy)
     if not resp:
         return [], []
 
@@ -546,16 +585,18 @@ def _fetch_one_sitemap(session: requests.Session, sitemap_url: str) -> tuple:
         except OSError:
             pass
 
-    return parse_sitemap_xml(raw)
+    return await _run_cpu(parse_sitemap_xml, raw)
 
 
-def discover_all_page_urls(session: requests.Session, base_url: str,
-                            robots: Optional["RobotsPolicy"] = None) -> list:
+async def discover_all_page_urls(session: aiohttp.ClientSession, base_url: str,
+                                  robots: Optional["RobotsPolicy"] = None,
+                                  proxy: Optional[str] = None) -> list:
     """Breadth-first, concurrent sitemap discovery. A sitemap index with many
     locale/category child files used to be fetched one at a time, recursively
     — taking as long as the SUM of every file fetch. This processes one
-    "wave" of URLs at a time through a shared thread pool, so a wide sitemap
-    tree takes roughly as long as its slowest single fetch instead."""
+    "wave" of URLs at a time via an asyncio.Semaphore-bounded gather, so a
+    wide sitemap tree takes roughly as long as its slowest single fetch
+    instead."""
     # Sitemaps declared in robots.txt are already known; add common guesses.
     candidates = list(robots.sitemaps) if robots else []
     candidates += [urljoin(base_url, p) for p in COMMON_SITEMAP_PATHS]
@@ -566,27 +607,35 @@ def discover_all_page_urls(session: requests.Session, base_url: str,
     page_count = 0
     frontier = [u for u in dict.fromkeys(candidates) if u not in seen]
 
-    with ThreadPoolExecutor(max_workers=SITEMAP_FETCH_WORKERS) as executor:
-        depth = 0
-        while frontier and fetch_count < MAX_SITEMAP_FETCHES_PER_DOMAIN and page_count < MAX_TOTAL_SITEMAP_PAGES:
-            wave = frontier[:MAX_SITEMAP_FETCHES_PER_DOMAIN - fetch_count]
-            for u in wave:
-                seen.add(u)
-            fetch_count += len(wave)
+    sem = asyncio.Semaphore(SITEMAP_FETCH_WORKERS)
 
-            futures = {executor.submit(_fetch_one_sitemap, session, u): u for u in wave}
-            next_frontier: list = []
-            for future in as_completed(futures):
-                children, pages = future.result()
-                if pages:
-                    all_pages.extend(pages)
-                    page_count += len(pages)
-                if depth < MAX_SITEMAP_DEPTH:
-                    next_frontier.extend(c for c in children if c not in seen)
+    async def _bounded_fetch(u: str) -> tuple:
+        async with sem:
+            return await _fetch_one_sitemap(session, u, proxy)
 
-            frontier = list(dict.fromkeys(next_frontier))
-            depth += 1
+    depth = 0
+    while frontier and fetch_count < MAX_SITEMAP_FETCHES_PER_DOMAIN and page_count < MAX_TOTAL_SITEMAP_PAGES:
+        wave = frontier[:MAX_SITEMAP_FETCHES_PER_DOMAIN - fetch_count]
+        for u in wave:
+            seen.add(u)
+        fetch_count += len(wave)
 
+        results = await asyncio.gather(*(_bounded_fetch(u) for u in wave))
+        next_frontier: list = []
+        for children, pages in results:
+            if pages:
+                all_pages.extend(pages)
+                page_count += len(pages)
+            if depth < MAX_SITEMAP_DEPTH:
+                next_frontier.extend(c for c in children if c not in seen)
+
+        frontier = list(dict.fromkeys(next_frontier))
+        depth += 1
+
+    return await _run_cpu(_dedupe_and_filter_pages, all_pages, robots)
+
+
+def _dedupe_and_filter_pages(all_pages: list, robots: Optional["RobotsPolicy"]) -> list:
     pages = list(dict.fromkeys(all_pages))  # dedupe, preserve order
     if robots:
         pages = [u for u in pages if robots.can_fetch(u)]
@@ -792,7 +841,7 @@ def extract_emails_from_html(html: str) -> set:
 
 _dns_cache: dict = {}
 
-def domain_has_mx(domain: str) -> bool:
+def _domain_has_mx_sync(domain: str) -> bool:
     if domain in _dns_cache:
         return _dns_cache[domain]
     try:
@@ -811,107 +860,113 @@ def domain_has_mx(domain: str) -> bool:
     return result
 
 
+async def domain_has_mx(domain: str) -> bool:
+    """dnspython has no native asyncio resolver, so the blocking lookup runs
+    in the default executor thread pool instead of on the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _domain_has_mx_sync, domain)
+
+
 # --------------------------------------------------------------------------
 # Optional: Playwright fallback for JS-rendered footers (soft dependency)
 # --------------------------------------------------------------------------
 # Some sites inject their footer/contact info entirely client-side, so a
-# plain `requests` GET sees an empty shell. This fallback only runs when the
+# plain HTTP GET sees an empty shell. This fallback only runs when the
 # static pass already found zero emails for a domain — Playwright is much
 # heavier than a plain HTTP request (spins up a real Chromium instance), so
 # it's not worth paying that cost on every domain.
 
 PLAYWRIGHT_PAGE_TIMEOUT_MS = 20000
 # Each PlaywrightFetcher launches a real Chromium process (typically
-# 200-500MB+). Domain processing runs across many concurrent worker
-# threads, so without a cap, several domains needing the fallback at the
-# same time launch that many Chromium instances simultaneously — this is
-# exactly what caused an out-of-memory crash on a resource-constrained
-# host (Railway) even though the CLI/local runs never hit it. This
-# semaphore bounds concurrent Chromium instances independently of the
-# batch's overall --workers setting.
+# 200-500MB+). Domain processing runs across many concurrent asyncio tasks,
+# so without a cap, several domains needing the fallback at the same time
+# launch that many Chromium instances simultaneously — this is exactly what
+# caused an out-of-memory crash on a resource-constrained host (Railway)
+# even though local runs never hit it. This semaphore bounds concurrent
+# Chromium instances independently of the batch's overall --workers setting.
 MAX_CONCURRENT_PLAYWRIGHT_INSTANCES = 1
-_playwright_semaphore = threading.Semaphore(MAX_CONCURRENT_PLAYWRIGHT_INSTANCES)
+_playwright_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PLAYWRIGHT_INSTANCES)
 
 
 class PlaywrightFetcher:
     """Launches one headless Chromium instance and reuses it across every
     page fetched for a single domain, closing it when done."""
 
-    def __enter__(self):
-        from playwright.sync_api import sync_playwright  # raises ImportError if not installed
-        self._pw = sync_playwright().start()
+    async def __aenter__(self):
+        from playwright.async_api import async_playwright  # raises ImportError if not installed
+        self._pw = await async_playwright().start()
         try:
-            self._browser = self._pw.chromium.launch(headless=True)
+            self._browser = await self._pw.chromium.launch(headless=True)
         except Exception as exc:
             # Hosts like Streamlit Cloud install apt deps via packages.txt but
             # have no build hook to download the actual browser binary, so the
             # first Playwright-enabled run on a fresh container needs to fetch
             # it here — a one-time ~300MB download, slow but self-healing.
             if "Executable doesn't exist" not in str(exc):
-                self._pw.stop()
+                await self._pw.stop()
                 raise
             import subprocess
             import sys
             subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-            self._browser = self._pw.chromium.launch(headless=True)
+            self._browser = await self._pw.chromium.launch(headless=True)
         return self
 
-    def fetch(self, url: str) -> Optional[str]:
+    async def fetch(self, url: str) -> Optional[str]:
         try:
-            page = self._browser.new_page(user_agent=random.choice(USER_AGENTS))
+            page = await self._browser.new_page(user_agent=random.choice(USER_AGENTS))
             try:
                 # "networkidle" is unreliable on real sites — analytics beacons,
                 # chat widgets, and websockets keep the network busy forever on
                 # many pages, turning this into a guaranteed timeout. Wait for
                 # the DOM instead, then give client-side rendering a moment.
-                page.goto(url, timeout=PLAYWRIGHT_PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)
-                return page.content()
+                await page.goto(url, timeout=PLAYWRIGHT_PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
+                return await page.content()
             finally:
-                page.close()
+                await page.close()
         except Exception:
             return None
 
-    def __exit__(self, *exc_info):
+    async def __aexit__(self, *exc_info):
         try:
-            self._browser.close()
+            await self._browser.close()
         finally:
-            self._pw.stop()
+            await self._pw.stop()
 
 
-def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: list, delay: float) -> None:
+async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: list, delay: float) -> None:
     """Re-fetches pages with a real headless browser when the static pass
     found nothing, to catch footers/contact info rendered by client-side JS.
     Only MAX_CONCURRENT_PLAYWRIGHT_INSTANCES domains can be running a
     Chromium instance at any moment — other domains needing the fallback
-    block here until a slot frees up, trading some wall-clock time for a
+    wait here until a slot frees up, trading some wall-clock time for a
     bounded memory ceiling regardless of --workers."""
-    with _playwright_semaphore:
+    async with _playwright_semaphore:
         try:
-            with PlaywrightFetcher() as pf:
+            async with PlaywrightFetcher() as pf:
                 urls_to_try = pages_to_check or [base_url]
                 extra_links: list = []
 
                 for page_url in urls_to_try[:MAX_PAGES_PER_DOMAIN]:
-                    html = pf.fetch(page_url)
-                    time.sleep(delay)
+                    html = await pf.fetch(page_url)
+                    await asyncio.sleep(delay)
                     if not html:
                         continue
                     if not pages_to_check:
                         # Homepage was previously unreachable/empty; now that we
                         # have JS-rendered HTML, look for contact links in it too.
-                        extra_links = find_contact_links_on_page(html, base_url)
-                    found = extract_emails_from_html(html)
+                        extra_links = await _run_cpu(find_contact_links_on_page, html, base_url)
+                    found = await _run_cpu(extract_emails_from_html, html)
                     if found:
                         result.emails |= found
                         result.source_pages.add(page_url)
 
                 for link_url in extra_links[:MAX_PAGES_PER_DOMAIN - 1]:
-                    html = pf.fetch(link_url)
-                    time.sleep(delay)
+                    html = await pf.fetch(link_url)
+                    await asyncio.sleep(delay)
                     if not html:
                         continue
-                    found = extract_emails_from_html(html)
+                    found = await _run_cpu(extract_emails_from_html, html)
                     if found:
                         result.emails |= found
                         result.source_pages.add(link_url)
@@ -933,8 +988,8 @@ def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: l
 # Per-domain pipeline
 # --------------------------------------------------------------------------
 
-def fetch_and_extract_pages(session: requests.Session, urls: list, robots: "RobotsPolicy",
-                             delay: float) -> tuple:
+async def fetch_and_extract_pages(session: aiohttp.ClientSession, urls: list, robots: "RobotsPolicy",
+                                   delay: float, proxy: Optional[str] = None) -> tuple:
     """Fetches a domain's candidate pages concurrently (they're independent
     of each other, so there's no reason to wait for one before starting the
     next) and extracts emails from each. `delay` staggers when each fetch
@@ -946,29 +1001,37 @@ def fetch_and_extract_pages(session: requests.Session, urls: list, robots: "Robo
     if not allowed_urls:
         return emails, source_pages
 
-    def _fetch_one(url: str) -> tuple:
-        resp = fetch(session, url)
+    sem = asyncio.Semaphore(min(PER_DOMAIN_FETCH_WORKERS, len(allowed_urls)))
+
+    async def _fetch_one(url: str) -> tuple:
+        async with sem:
+            resp = await fetch(session, url, proxy=proxy)
         if not resp:
             return url, None
-        return url, extract_emails_from_html(resp.text)
+        return url, await _run_cpu(extract_emails_from_html, resp.text)
 
-    max_workers = min(PER_DOMAIN_FETCH_WORKERS, len(allowed_urls))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for url in allowed_urls:
-            futures.append(executor.submit(_fetch_one, url))
-            if delay:
-                time.sleep(delay)
-        for future in as_completed(futures):
-            url, found = future.result()
-            if found:
-                emails |= found
-                source_pages.add(url)
+    tasks = []
+    for url in allowed_urls:
+        tasks.append(asyncio.create_task(_fetch_one(url)))
+        if delay:
+            await asyncio.sleep(delay)
+
+    # asyncio.gather (not as_completed) is required here: if this function's
+    # caller is itself cancelled (the per-domain hard timeout), gather
+    # propagates that cancellation to every task above before re-raising —
+    # as_completed does NOT, which left orphaned tasks running against an
+    # already-closed aiohttp session in testing (RuntimeError: Session is
+    # closed) once the parent's `async with ClientSession()` block exited.
+    results = await asyncio.gather(*tasks)
+    for url, found in results:
+        if found:
+            emails |= found
+            source_pages.add(url)
     return emails, source_pages
 
 
-def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_mx: bool,
-                    use_playwright: bool = False, respect_robots: bool = True) -> DomainResult:
+async def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_mx: bool,
+                          use_playwright: bool = False, respect_robots: bool = True) -> DomainResult:
     result = DomainResult(input_url=raw_url)
     base_url = normalize_to_base_url(raw_url)
     result.domain = get_bare_domain(base_url)
@@ -976,71 +1039,80 @@ def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_m
         result.error = "could not parse domain"
         return result
 
-    if not probe_domain_reachable(base_url):
+    # A proxy is picked once per domain (not per request), matching the
+    # original per-session proxy assignment.
+    proxy = random.choice(proxies) if proxies else None
+
+    if not await probe_domain_reachable(base_url, proxy):
         result.method = "none"
         result.error = "domain unreachable (fast-fail connectivity probe)"
         if use_playwright:
-            playwright_fallback(result, base_url, [], delay)
+            await playwright_fallback(result, base_url, [], delay)
         return result
 
-    session = build_session(proxies)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout, connector=_new_connector()) as session:
+        try:
+            robots = await fetch_robots_policy(session, base_url, proxy, respect_robots=respect_robots)
 
-    try:
-        robots = fetch_robots_policy(session, base_url, respect_robots=respect_robots)
+            all_pages = await discover_all_page_urls(session, base_url, robots, proxy)
+            # Offloaded like the sitemap/HTML parsing above — a huge sitemap
+            # (figma.com's real community-file index has 368k+ URLs) makes
+            # this pure-Python scan itself a multi-second event-loop-blocking
+            # CPU spike (measured: ~24s at that scale) if run inline.
+            contact_urls = await _run_cpu(rank_contact_urls, all_pages, base_url)
 
-        all_pages = discover_all_page_urls(session, base_url, robots)
-        contact_urls = rank_contact_urls(all_pages, base_url)
+            home_resp = None
+            pages_to_check = []
+            if contact_urls:
+                result.method = "sitemap"
+                pages_to_check = contact_urls
+            else:
+                result.method = "homepage-fallback"
+                if robots.can_fetch(base_url):
+                    home_resp = await fetch(session, base_url, proxy=proxy)
+                if home_resp:
+                    pages_to_check = [base_url]
+                    extra_links = await _run_cpu(find_contact_links_on_page, home_resp.text, base_url)
+                    pages_to_check += [u for u in extra_links if robots.can_fetch(u)][:MAX_PAGES_PER_DOMAIN - 1]
 
-        home_resp = None
-        pages_to_check = []
-        if contact_urls:
-            result.method = "sitemap"
-            pages_to_check = contact_urls
-        else:
-            result.method = "homepage-fallback"
-            if robots.can_fetch(base_url):
-                home_resp = fetch(session, base_url)
-            if home_resp:
-                pages_to_check = [base_url]
-                extra_links = find_contact_links_on_page(home_resp.text, base_url)
-                pages_to_check += [u for u in extra_links if robots.can_fetch(u)][:MAX_PAGES_PER_DOMAIN - 1]
+            if not pages_to_check:
+                result.method = "none"
+                result.error = "no sitemap, no contact links, homepage unreachable"
+                if use_playwright:
+                    await playwright_fallback(result, base_url, pages_to_check, delay)
+                return result
 
-        if not pages_to_check:
-            result.method = "none"
-            result.error = "no sitemap, no contact links, homepage unreachable"
-            if use_playwright:
-                playwright_fallback(result, base_url, pages_to_check, delay)
-            return result
-
-        found, source_pages = fetch_and_extract_pages(
-            session, pages_to_check[:MAX_PAGES_PER_DOMAIN], robots, delay
-        )
-        result.emails |= found
-        result.source_pages |= source_pages
-
-        # Shallow second hop: sitemap + footer-keyword discovery both failed
-        # to surface anything useful, so try a few more same-domain nav links
-        # from the homepage before giving up or falling back to Playwright.
-        if not result.emails and result.method == "homepage-fallback" and home_resp:
-            second_hop_urls = find_second_hop_links(home_resp.text, base_url, set(pages_to_check))
-            found, source_pages = fetch_and_extract_pages(session, second_hop_urls, robots, delay)
+            found, source_pages = await fetch_and_extract_pages(
+                session, pages_to_check[:MAX_PAGES_PER_DOMAIN], robots, delay, proxy
+            )
             result.emails |= found
             result.source_pages |= source_pages
 
-        if not result.emails and use_playwright:
-            playwright_fallback(result, base_url, pages_to_check, delay)
+            # Shallow second hop: sitemap + footer-keyword discovery both failed
+            # to surface anything useful, so try a few more same-domain nav links
+            # from the homepage before giving up or falling back to Playwright.
+            if not result.emails and result.method == "homepage-fallback" and home_resp:
+                second_hop_urls = await _run_cpu(
+                    find_second_hop_links, home_resp.text, base_url, set(pages_to_check)
+                )
+                found, source_pages = await fetch_and_extract_pages(session, second_hop_urls, robots, delay, proxy)
+                result.emails |= found
+                result.source_pages |= source_pages
 
-        if verify_mx and result.emails:
-            result.emails = {
-                e for e in result.emails
-                if domain_has_mx(e.partition("@")[2])
-            }
+            if not result.emails and use_playwright:
+                await playwright_fallback(result, base_url, pages_to_check, delay)
 
-        if not result.emails:
-            result.error = result.error or "no emails found on checked pages"
+            if verify_mx and result.emails:
+                emails_list = list(result.emails)
+                mx_checks = await asyncio.gather(*(domain_has_mx(e.partition("@")[2]) for e in emails_list))
+                result.emails = {e for e, ok in zip(emails_list, mx_checks) if ok}
 
-    except Exception as exc:  # noqa: BLE001 - keep batch running on a single-domain failure
-        result.error = f"unexpected error: {exc}"
+            if not result.emails:
+                result.error = result.error or "no emails found on checked pages"
+
+        except Exception as exc:  # noqa: BLE001 - keep batch running on a single-domain failure
+            result.error = f"unexpected error: {exc}"
 
     return result
 
@@ -1097,82 +1169,108 @@ def result_to_row(r: "DomainResult") -> dict:
     }
 
 
-def drain_futures_with_hard_timeout(futures_to_url: dict, per_domain_timeout: float = DOMAIN_HARD_TIMEOUT_SECONDS):
-    """Yields (url, DomainResult) as domain-processing futures complete, but
-    gives up on any single future that's been pending longer than
-    per_domain_timeout — rather than letting one stuck domain block every
-    other (already-finished-or-finishing) domain in the batch forever.
-    Shared by the CLI batch runner and the Streamlit dashboard.
-
-    Python has no way to forcibly kill a running thread, so an abandoned
-    worker may keep executing in the background after being given up on —
-    this only stops it from blocking the caller's progress/output."""
-    pending = dict(futures_to_url)  # future -> url
-    started_at = {f: time.time() for f in pending}
-    while pending:
-        done, _ = wait(pending.keys(), timeout=5, return_when=FIRST_COMPLETED)
-        now = time.time()
-        for f in list(done):
-            url = pending.pop(f)
-            started_at.pop(f, None)
-            yield url, f.result()
-        for f in list(pending.keys()):
-            if now - started_at[f] >= per_domain_timeout:
-                url = pending.pop(f)
-                started_at.pop(f, None)
-                r = DomainResult(input_url=url)
-                r.domain = get_bare_domain(normalize_to_base_url(url))
-                r.method = "none"
-                r.error = (
-                    f"gave up after {per_domain_timeout:.0f}s - domain appears stuck "
-                    "beyond normal timeouts (e.g. a DNS/TLS-level stall)"
-                )
-                yield url, r
+async def _process_domain_with_hard_timeout(sem: asyncio.Semaphore, url: str, delay: float,
+                                             proxies: Optional[list], verify_mx: bool,
+                                             use_playwright: bool, respect_robots: bool) -> DomainResult:
+    """Bounds overall concurrency to `sem`'s size and gives up on any single
+    domain that's still running after DOMAIN_HARD_TIMEOUT_SECONDS — rather
+    than letting one stuck domain (e.g. a DNS/TLS-level stall) block every
+    other domain in the batch forever. asyncio.wait_for actually cancels the
+    coroutine at its next await point, which also frees this domain's
+    semaphore slot for the next one — unlike an abandoned OS thread, which
+    keeps its worker slot occupied for as long as it keeps running."""
+    async with sem:
+        try:
+            return await asyncio.wait_for(
+                process_domain(url, delay, proxies, verify_mx, use_playwright, respect_robots),
+                timeout=DOMAIN_HARD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            r = DomainResult(input_url=url)
+            r.domain = get_bare_domain(normalize_to_base_url(url))
+            r.method = "none"
+            r.error = (
+                f"gave up after {DOMAIN_HARD_TIMEOUT_SECONDS:.0f}s - domain appears stuck "
+                "beyond normal timeouts (e.g. a DNS/TLS-level stall)"
+            )
+            return r
 
 
-def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
-              proxies_path: Optional[str] = None, verify_mx: bool = False,
-              use_playwright: bool = False, respect_robots: bool = True) -> None:
+def _size_default_executor(max_workers: int) -> None:
+    """The event loop's default executor backs both our own CPU-bound
+    offloading (_run_cpu) and aiohttp's ThreadedResolver DNS lookups. Its
+    default size (min(32, os.cpu_count()+4)) is easily oversubscribed once
+    several domains run concurrently, each needing several DNS lookups plus
+    occasional sitemap/HTML parsing — found via a real regression where
+    perfectly reachable domains (figma.com, hubspot.com, slack.com) failed
+    the fast-fail probe only when run as part of a concurrent batch, not
+    when run one at a time. Sized relative to the batch's own concurrency
+    so it can't become the bottleneck."""
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(max_workers=max(32, max_workers * 8))
+    )
+
+
+async def process_domains_streaming(domains: list, max_workers: int, delay: float,
+                                     proxies: Optional[list], verify_mx: bool,
+                                     use_playwright: bool, respect_robots: bool
+                                     ) -> AsyncIterator[tuple]:
+    """Async generator yielding (done_count, total, DomainResult) as each
+    domain finishes, bounded to `max_workers` concurrent domains with a hard
+    per-domain timeout. Shared by the CLI batch runner and the Streamlit
+    dashboard so both stay in sync."""
+    _size_default_executor(max_workers)
+    sem = asyncio.Semaphore(max_workers)
+    total = len(domains)
+    tasks = [
+        asyncio.create_task(
+            _process_domain_with_hard_timeout(sem, url, delay, proxies, verify_mx, use_playwright, respect_robots)
+        )
+        for url in domains
+    ]
+    done_count = 0
+    for coro in asyncio.as_completed(tasks):
+        r = await coro
+        done_count += 1
+        yield done_count, total, r
+
+
+def _check_playwright_installed() -> None:
+    # Fail fast with a clear message rather than letting every domain's
+    # fallback silently no-op with an ImportError buried in its error column.
+    try:
+        import playwright.async_api  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "use_playwright=True but the 'playwright' package (and its browser "
+            "binaries) is not installed. Run:\n"
+            "  pip install playwright\n"
+            "  playwright install chromium"
+        )
+
+
+async def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
+                     proxies_path: Optional[str] = None, verify_mx: bool = False,
+                     use_playwright: bool = False, respect_robots: bool = True) -> None:
     domains = load_domains(input_path)
     proxies = load_proxies(proxies_path)
 
     if use_playwright:
-        # Fail fast with a clear message rather than letting every domain's
-        # fallback silently no-op with an ImportError buried in its error column.
-        try:
-            import playwright.sync_api  # noqa: F401
-        except ImportError:
-            raise RuntimeError(
-                "use_playwright=True but the 'playwright' package (and its browser "
-                "binaries) is not installed. Run:\n"
-                "  pip install playwright\n"
-                "  playwright install chromium"
-            )
+        _check_playwright_installed()
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         f.flush()
 
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        try:
-            futures = {
-                executor.submit(process_domain, url, delay, proxies, verify_mx,
-                                use_playwright, respect_robots): url
-                for url in domains
-            }
-            done_count = 0
-            for _url, r in drain_futures_with_hard_timeout(futures):
-                writer.writerow(result_to_row(r))
-                f.flush()
-                done_count += 1
-                status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
-                print(f"[{done_count}/{len(domains)}] {r.domain or r.input_url}: {status}", flush=True)
-        finally:
-            # wait=False: if a domain was abandoned above for exceeding the
-            # hard timeout, its thread may still be running — don't let our
-            # own shutdown block on it too.
-            executor.shutdown(wait=False)
+        async for done_count, total, r in process_domains_streaming(
+            domains, max_workers, delay, proxies, verify_mx, use_playwright, respect_robots
+        ):
+            writer.writerow(result_to_row(r))
+            f.flush()
+            status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
+            print(f"[{done_count}/{total}] {r.domain or r.input_url}: {status}", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -1195,7 +1293,7 @@ def main():
                               "Only use on sites you own or have permission to crawl.")
     args = parser.parse_args()
 
-    run_batch(
+    asyncio.run(run_batch(
         input_path=args.input,
         output_path=args.output,
         max_workers=args.workers,
@@ -1204,7 +1302,7 @@ def main():
         verify_mx=args.verify_mx,
         use_playwright=args.use_playwright,
         respect_robots=not args.ignore_robots,
-    )
+    ))
 
 
 if __name__ == "__main__":

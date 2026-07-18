@@ -9,8 +9,8 @@ Deploy free:   push this folder to a GitHub repo, connect it at
                https://streamlit.io/cloud
 """
 
+import asyncio
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import streamlit as st
@@ -66,6 +66,37 @@ domains_text = st.text_area(
 
 run_clicked = st.button("Run scraper", type="primary")
 
+
+async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_playwright,
+                           respect_robots, progress_bar, status_text, timer_text,
+                           table_placeholder, start_time):
+    """Drives process_domains_streaming() and pushes each result into the
+    live Streamlit UI as it arrives. Runs inside a single asyncio.run() call
+    from the synchronous Streamlit script — verified safe in isolation
+    before this rewrite (progress_bar/status_text updates render correctly
+    mid-run, and a stuck domain is genuinely cancelled at its timeout rather
+    than blocking the rest of the batch)."""
+    rows = []
+    total = len(domains)
+    async for done, _total, r in es.process_domains_streaming(
+        domains, max_workers, delay, proxies, verify_mx, use_playwright, respect_robots
+    ):
+        rows.append(es.result_to_row(r))
+        elapsed = time.time() - start_time
+
+        progress_bar.progress(done / total)
+        status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
+        status_text.text(f"[{done}/{total}] {r.domain or r.input_url}: {status}")
+        rate = done / elapsed if elapsed > 0 else 0
+        remaining = (total - done) / rate if rate > 0 else 0
+        timer_text.text(
+            f"Elapsed: {elapsed:.0f}s | Rate: {rate:.1f} domains/s | "
+            f"Est. remaining: {remaining:.0f}s"
+        )
+        table_placeholder.dataframe(pd.DataFrame(rows), width='stretch')
+    return rows
+
+
 if run_clicked:
     domains = [
         line.split(",")[0].strip()
@@ -80,7 +111,7 @@ if run_clicked:
 
     if use_playwright:
         try:
-            import playwright.sync_api  # noqa: F401
+            import playwright.async_api  # noqa: F401
         except ImportError:
             st.error(
                 "Playwright fallback is checked but not installed on this host. "
@@ -94,41 +125,17 @@ if run_clicked:
     timer_text = st.empty()
     table_placeholder = st.empty()
 
-    rows = []
-    total = len(domains)
     start_time = time.time()
-    executor = ThreadPoolExecutor(max_workers=workers)
-    try:
-        futures = {
-            executor.submit(es.process_domain, url, delay, proxies, verify_mx,
-                            use_playwright, respect_robots): url
-            for url in domains
-        }
-        # A hard per-domain timeout so one stuck domain (e.g. a DNS/TLS-level
-        # stall beyond the scraper's own request timeouts) can't block the
-        # rest of the batch, or leave the dashboard stuck mid-run forever.
-        for done, (_url, r) in enumerate(es.drain_futures_with_hard_timeout(futures), start=1):
-            rows.append(es.result_to_row(r))
-            elapsed = time.time() - start_time
-
-            progress_bar.progress(done / total)
-            status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
-            status_text.text(f"[{done}/{total}] {r.domain or r.input_url}: {status}")
-            rate = done / elapsed if elapsed > 0 else 0
-            remaining = (total - done) / rate if rate > 0 else 0
-            timer_text.text(
-                f"Elapsed: {elapsed:.0f}s | Rate: {rate:.1f} domains/s | "
-                f"Est. remaining: {remaining:.0f}s"
-            )
-            table_placeholder.dataframe(pd.DataFrame(rows), width='stretch')
-    finally:
-        executor.shutdown(wait=False)
+    rows = asyncio.run(_run_batch_live(
+        domains, workers, delay, proxies, verify_mx, use_playwright, respect_robots,
+        progress_bar, status_text, timer_text, table_placeholder, start_time,
+    ))
 
     total_elapsed = time.time() - start_time
     st.session_state.results = rows
     st.session_state.last_run_seconds = total_elapsed
-    st.success(f"Done — {total} domain(s) processed in {total_elapsed:.1f}s "
-               f"({total_elapsed / total:.1f}s/domain average).")
+    st.success(f"Done — {len(domains)} domain(s) processed in {total_elapsed:.1f}s "
+               f"({total_elapsed / len(domains):.1f}s/domain average).")
 
 if st.session_state.results:
     df = pd.DataFrame(st.session_state.results)

@@ -1,4 +1,4 @@
-requests>=2.31
+aiohttp>=3.9
 beautifulsoup4>=4.12
 lxml>=5.2
 dnspython>=2.6

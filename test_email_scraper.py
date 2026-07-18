@@ -10,7 +10,9 @@ Run with either:
     pytest test_email_scraper.py -v      (if pytest is installed)
 """
 
+import asyncio
 import unittest
+import unittest.mock
 from urllib import robotparser
 
 import email_scraper as es
@@ -306,40 +308,41 @@ class TestUrlNormalization(unittest.TestCase):
         self.assertEqual(es.get_bare_domain("https://www.example.com"), "example.com")
 
 
-class TestDrainFuturesWithHardTimeout(unittest.TestCase):
-    def test_stuck_future_does_not_block_others(self):
+class TestProcessDomainsHardTimeout(unittest.IsolatedAsyncioTestCase):
+    async def test_stuck_domain_does_not_block_others(self):
         # Regression: a genuinely hung domain (artstation.com, 5+ minutes
         # with zero CPU activity — a DNS/TLS-level stall beyond the
         # scraper's own request timeouts) blocked an entire 300-domain
         # batch indefinitely, even with 299/300 already done. This proves
-        # the drain function gives up on a stuck future instead of waiting
-        # for it, without disturbing a concurrently-completing fast one.
+        # asyncio.wait_for genuinely cancels a stuck domain's task instead
+        # of waiting for it, without disturbing a concurrently-completing
+        # fast one. process_domain itself is faked out here so the test
+        # stays network-free/deterministic; only the timeout/cancellation
+        # plumbing in process_domains_streaming is under test.
         import time
-        from concurrent.futures import ThreadPoolExecutor
 
-        def fast():
-            return "fast result"
+        async def fake_process_domain(url, delay, proxies, verify_mx, use_playwright, respect_robots):
+            if url == "stuck.com":
+                await asyncio.sleep(30)
+                return es.DomainResult(input_url=url, error="should never be reached within the test's timeout")
+            r = es.DomainResult(input_url=url)
+            r.emails = {"hello@fast.com"}
+            return r
 
-        def stuck():
-            time.sleep(30)
-            return "should never be reached within the test's timeout"
-
-        executor = ThreadPoolExecutor(max_workers=2)
-        try:
-            futures = {
-                executor.submit(fast): "fast.com",
-                executor.submit(stuck): "stuck.com",
-            }
+        with unittest.mock.patch.object(es, "process_domain", fake_process_domain), \
+                unittest.mock.patch.object(es, "DOMAIN_HARD_TIMEOUT_SECONDS", 1):
             t0 = time.time()
-            results = dict(es.drain_futures_with_hard_timeout(futures, per_domain_timeout=1))
+            results = {}
+            async for _done, _total, r in es.process_domains_streaming(
+                ["fast.com", "stuck.com"], max_workers=2, delay=0,
+                proxies=None, verify_mx=False, use_playwright=False, respect_robots=True,
+            ):
+                results[r.input_url] = r
             elapsed = time.time() - t0
-        finally:
-            executor.shutdown(wait=False)
 
         # Must return well before the stuck task's 30s sleep would finish.
         self.assertLess(elapsed, 15)
-        self.assertEqual(results["fast.com"], "fast result")
-        self.assertTrue(hasattr(results["stuck.com"], "error"))
+        self.assertEqual(results["fast.com"].emails, {"hello@fast.com"})
         self.assertIn("gave up after", results["stuck.com"].error)
 
 
