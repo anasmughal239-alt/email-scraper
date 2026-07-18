@@ -756,8 +756,20 @@ def rank_contact_urls(urls: list, base_url: str, limit: int = MAX_PAGES_PER_DOMA
 
         # A deep path (help-center article, doc page, etc.) only counts as
         # contact-like if it matched an unambiguous phrase, not a generic
-        # word that also shows up in ordinary tutorial/doc slugs.
-        if len(segments) > MAX_SOFT_MATCH_DEPTH and not (matched & HARD_CONTACT_KEYWORDS):
+        # word that also shows up in ordinary tutorial/doc slugs. The hard
+        # match must come from a WHOLE path segment (e.g. /contact/,
+        # /contact-us/), not merely a hyphen-split sub-token buried inside a
+        # longer compound segment — otherwise product-category pages like
+        # /marketplace/.../vonage-contact-center/ falsely bypass the depth
+        # limit purely because "contact-center" splits into a "contact"
+        # sub-token, crowding out the real /contact/ page from the top-N
+        # candidates that actually get fetched. Found via a real batch:
+        # zendesk.com's genuine /contact/ and /company/contact-info/ pages
+        # existed in its sitemap but never made the candidate list because
+        # a dozen unrelated "contact centre" marketplace listings outranked
+        # them under the old (sub-token-eligible) rule.
+        hard_segment_matches = HARD_CONTACT_KEYWORDS & set(segments)
+        if len(segments) > MAX_SOFT_MATCH_DEPTH and not hard_segment_matches:
             continue
 
         # Prefer shallow, dedicated pages (e.g. /contact) over deep ones.
