@@ -526,17 +526,25 @@ async def check_all_proxies_health(proxies: list) -> list:
 async def filter_alive_proxies(proxies: list) -> tuple:
     """Runs a health check over `proxies` and returns (usable_proxies,
     dead_count), so a batch skips proxies already known to be down instead
-    of wasting a request routing a new domain through one. If every proxy
-    fails the check, returns the original full list unchanged (dead_count
-    == len(proxies) in that case) rather than silently falling back to a
-    direct connection — that would silently change which IP the scraper's
-    traffic appears to come from, a bigger behavior change than just
-    letting the batch fail per-domain the same way it always did when
-    routed through a bad proxy."""
+    of wasting a request routing a new domain through one.
+
+    If every proxy fails the check, returns an empty list (dead_count ==
+    len(proxies)) so the caller falls back to a direct connection, rather
+    than continuing to route every domain through proxies already known to
+    be dead. An earlier version kept using the dead list on the theory that
+    silently switching to a direct connection was a bigger behavior change
+    than letting requests fail per-domain — that reasoning broke down in
+    practice: a real 2118-domain batch ran entirely through 10 Webshare
+    proxies that had exhausted their bandwidth quota (health-check-dead),
+    and "keep trying anyway" turned a proxy outage into ~1300 false
+    "domain unreachable" results, when most of those sites would have
+    scraped fine directly. Callers still get a loud, explicit warning when
+    this happens — it just no longer means "run the whole batch through
+    connections guaranteed to fail." """
     results = await check_all_proxies_health(proxies)
     alive = [r["proxy"] for r in results if r["alive"]]
     dead_count = len(proxies) - len(alive)
-    return (alive or proxies), dead_count
+    return alive, dead_count
 
 
 # --------------------------------------------------------------------------
@@ -1368,8 +1376,8 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
         proxies, dead_count = await filter_alive_proxies(proxies)
         if dead_count == original_count:
             print(f"Proxy health check: all {original_count} proxie(s) failed — "
-                  "using them anyway since there's no healthy fallback (expect connection errors).",
-                  flush=True)
+                  "running this batch WITHOUT a proxy (direct connection) instead of "
+                  "through connections already known to be dead.", flush=True)
         elif dead_count:
             print(f"Proxy health check: {dead_count}/{original_count} proxie(s) failed "
                   "and will be skipped for this run.", flush=True)

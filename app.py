@@ -224,8 +224,10 @@ if run_clicked:
         with st.spinner("Checking proxy health before starting..."):
             proxies, dead_count = asyncio.run(es.filter_alive_proxies(proxies))
         if dead_count == original_count:
-            st.warning(f"All {original_count} proxies failed the health check — using them anyway "
-                       "since there's no healthy fallback (expect connection errors).")
+            proxies = None
+            st.warning(f"All {original_count} proxies failed the health check (often a bandwidth/"
+                       "quota issue, not a real outage) — running this batch WITHOUT a proxy "
+                       "(direct connection) instead of through connections already known to be dead.")
         elif dead_count:
             st.info(f"{dead_count} of {original_count} proxies failed the health check "
                     "and will be skipped for this run.")
