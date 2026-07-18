@@ -59,11 +59,46 @@ with st.sidebar:
              "to have been run on this machine — not available on most free cloud hosts.",
     )
     proxies_text = st.text_area(
-        "Proxies (optional, one per line)", height=80,
+        "Proxies (optional, one per line)", height=80, key="proxies_text",
         placeholder="http://user:pass@host:port",
         help="Free datacenter proxy lists are usually already blacklisted and won't help much. "
              "Leave empty unless you have a paid rotating endpoint.",
     )
+    health_check_interval = st.selectbox(
+        "Proxy health check interval", [15, 30, 60, 120], index=1,
+        format_func=lambda s: f"every {s}s",
+        help="How often the Proxy Health panel below re-checks each proxy.",
+    )
+
+@st.fragment(run_every=health_check_interval)
+def _proxy_health_panel():
+    """Re-checks every proxy on its own timer, independent of the rest of
+    the page — a plain st.rerun() loop would also restart any in-progress
+    scrape, which this must not do. st.fragment scopes the auto-refresh to
+    just this panel. Reads the proxies textarea via session_state (not a
+    closured variable) since a fragment-only rerun doesn't re-execute the
+    surrounding script, so session_state is the only way to see its current
+    value on each tick."""
+    proxies_raw = st.session_state.get("proxies_text", "")
+    proxies = [p.strip() for p in proxies_raw.splitlines() if p.strip()]
+    if not proxies:
+        st.caption("No proxies entered in the sidebar — add some to monitor their health here.")
+        return
+
+    results = asyncio.run(es.check_all_proxies_health(proxies))
+    df = pd.DataFrame(results)
+    df["status"] = df["alive"].map({True: "✅ alive", False: "❌ down"})
+    alive_count = int(df["alive"].sum())
+
+    st.caption(f"{alive_count}/{len(proxies)} alive — last checked {time.strftime('%H:%M:%S')}")
+    st.dataframe(
+        df[["proxy", "status", "latency_ms", "egress_ip", "error"]],
+        width='stretch', hide_index=True,
+    )
+
+
+st.subheader("🩺 Proxy Health")
+_proxy_health_panel()
 
 domains_text = st.text_area(
     "Domains", height=200,

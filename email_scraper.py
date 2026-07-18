@@ -35,6 +35,7 @@ import gzip
 import os
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 from urllib import robotparser
@@ -473,6 +474,53 @@ async def probe_domain_reachable(base_url: str, proxy: Optional[str] = None) -> 
         except (aiohttp.ClientError, asyncio.TimeoutError):
             continue
     return False
+
+
+# --------------------------------------------------------------------------
+# Proxy health checks (used by the Streamlit dashboard's live proxy panel)
+# --------------------------------------------------------------------------
+
+# A tiny, fast, plain-text endpoint whose only job is to echo back the
+# caller's IP — the standard way to confirm a proxy is both alive AND
+# actually being used (a bad proxy config can silently fall through to a
+# direct connection, which would otherwise still "work").
+PROXY_HEALTH_CHECK_URL = "https://api.ipify.org"
+PROXY_HEALTH_CHECK_TIMEOUT = 8
+
+
+async def check_proxy_health(proxy: str) -> dict:
+    """Verifies a single proxy is alive and measures its latency by fetching
+    PROXY_HEALTH_CHECK_URL through it. Returns a plain dict (not a dataclass)
+    since this is display data for the dashboard, not something threaded
+    through the scraping pipeline."""
+    timeout = aiohttp.ClientTimeout(total=PROXY_HEALTH_CHECK_TIMEOUT)
+    t0 = time.monotonic()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, connector=_new_connector()) as session:
+            async with session.get(PROXY_HEALTH_CHECK_URL, proxy=proxy) as resp:
+                if resp.status == 200:
+                    egress_ip = (await resp.text()).strip()
+                    return {
+                        "proxy": proxy,
+                        "alive": True,
+                        "latency_ms": round((time.monotonic() - t0) * 1000),
+                        "egress_ip": egress_ip,
+                        "error": "",
+                    }
+                return {
+                    "proxy": proxy, "alive": False, "latency_ms": None,
+                    "egress_ip": "", "error": f"HTTP {resp.status}",
+                }
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        return {
+            "proxy": proxy, "alive": False, "latency_ms": None,
+            "egress_ip": "", "error": str(exc) or type(exc).__name__,
+        }
+
+
+async def check_all_proxies_health(proxies: list) -> list:
+    """Checks every proxy concurrently; order matches the input list."""
+    return await asyncio.gather(*(check_proxy_health(p) for p in proxies))
 
 
 # --------------------------------------------------------------------------

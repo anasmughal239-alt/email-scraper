@@ -180,6 +180,13 @@ without tying up your own machine.
   supports `--proxies` if you have a paid rotating endpoint, but by default
   it just uses polite rate-limiting, retries with backoff, and rotating
   User-Agents — which will get you further than free datacenter IPs.
+- **Proxy health.** The dashboard (`app.py`) has a live "🩺 Proxy Health"
+  panel below the settings — it re-checks every proxy in the sidebar's
+  Proxies box on a timer (default every 30s, configurable) by fetching a
+  lightweight IP-echo endpoint through each one, and shows alive/dead,
+  latency, and the egress IP each proxy actually reports. This is purely a
+  monitoring panel: dead proxies aren't automatically excluded from
+  scraping rotation yet, they're just visible.
 - **JavaScript-rendered footers** are handled by the optional `--use-playwright`
   / `use_playwright=True` fallback (see above). It's opt-in and only triggers
   per-domain when the static pass finds nothing, since it's much slower.
