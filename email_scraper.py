@@ -416,6 +416,32 @@ def _new_connector() -> aiohttp.TCPConnector:
     return aiohttp.TCPConnector(resolver=ThreadedResolver())
 
 
+# aiohttp's default header-size limits (max_line_size/max_field_size =
+# 8190 bytes each) are tuned for ordinary sites, not modern e-commerce
+# pages — a large Content-Security-Policy header listing every third-party
+# script domain (Klaviyo, Listrak, ad pixels, etc.) routinely exceeds that
+# on real Shopify/DTC storefronts. Found via a real batch: mvmt.com raised
+# "Got more than 8190 bytes when reading" and was reported as completely
+# unreachable, even though the site was up and answering fine — the
+# request itself failed on header parsing before any of our own logic
+# (probe, robots.txt, sitemap) ever ran. Raised well past what any
+# legitimate site should need, rather than tuned to one observed value.
+_HEADER_SIZE_LIMIT = 65536
+
+
+def new_client_session(timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
+    """Single construction point for every aiohttp.ClientSession in this
+    module, so the header-size fix (and the DNS-resolver fix in
+    _new_connector) apply everywhere uniformly instead of needing to be
+    remembered at each call site."""
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        connector=_new_connector(),
+        max_line_size=_HEADER_SIZE_LIMIT,
+        max_field_size=_HEADER_SIZE_LIMIT,
+    )
+
+
 async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = REQUEST_TIMEOUT,
                  proxy: Optional[str] = None) -> Optional[_FetchResponse]:
     headers = {
@@ -467,7 +493,7 @@ async def probe_domain_reachable(base_url: str, proxy: Optional[str] = None) -> 
     timeout = aiohttp.ClientTimeout(total=FAST_FAIL_PROBE_TIMEOUT)
     for _ in range(2):
         try:
-            async with aiohttp.ClientSession(timeout=timeout, connector=_new_connector()) as session:
+            async with new_client_session(timeout) as session:
                 async with session.get(base_url, headers={"User-Agent": random.choice(USER_AGENTS)},
                                         allow_redirects=True, proxy=proxy):
                     return True
@@ -496,7 +522,7 @@ async def check_proxy_health(proxy: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=PROXY_HEALTH_CHECK_TIMEOUT)
     t0 = time.monotonic()
     try:
-        async with aiohttp.ClientSession(timeout=timeout, connector=_new_connector()) as session:
+        async with new_client_session(timeout) as session:
             async with session.get(PROXY_HEALTH_CHECK_URL, proxy=proxy) as resp:
                 if resp.status == 200:
                     egress_ip = (await resp.text()).strip()
@@ -1151,7 +1177,7 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
         return result
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout, connector=_new_connector()) as session:
+    async with new_client_session(timeout) as session:
         try:
             robots = await fetch_robots_policy(session, base_url, proxy, respect_robots=respect_robots)
 
