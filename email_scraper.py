@@ -31,12 +31,14 @@ import argparse
 import asyncio
 import concurrent.futures
 import csv
+import email.utils
 import gzip
 import os
 import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 from urllib import robotparser
 from urllib.parse import urljoin, urlparse
@@ -198,6 +200,21 @@ FAST_FAIL_PROBE_TIMEOUT = 6
 # be forcibly killed) — so the abandoned domain's task actually stops
 # rather than merely being ignored.
 DOMAIN_HARD_TIMEOUT_SECONDS = 180
+# Ceiling on how long we'll honor a server-requested Retry-After delay on a
+# single request. Respecting the value at all (rather than a fixed backoff)
+# is the correct, standard-compliant behavior for a 429 — but an
+# unreasonably long value from one server shouldn't be allowed to eat a
+# large fraction of DOMAIN_HARD_TIMEOUT_SECONDS.
+MAX_RETRY_AFTER_SECONDS = 15
+# Pause before the end-of-batch retry pass (--retry-failed), giving any
+# transient rate-limiting or temporary throttling encountered during the
+# main pass a real chance to have cleared before trying those domains
+# again.
+RETRY_COOLDOWN_SECONDS = 15
+# The retry pass runs at a lower, fixed concurrency than the main batch —
+# gentler on whatever triggered the original failures, since these domains
+# already showed some sign of trouble once.
+RETRY_MAX_WORKERS = 4
 MAX_SITEMAP_DEPTH = 3
 MAX_PAGES_PER_DOMAIN = 10
 # Large e-commerce/blog sites can have sitemap trees with thousands of child
@@ -442,6 +459,27 @@ def new_client_session(timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
     )
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parses a Retry-After header, which per RFC 7231 is either an integer
+    number of seconds or an HTTP-date. Returns None if missing/unparseable
+    (caller falls back to the fixed backoff in that case)."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delay = (dt - datetime.now(timezone.utc)).total_seconds()
+    return max(delay, 0.0)
+
+
 async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = REQUEST_TIMEOUT,
                  proxy: Optional[str] = None) -> Optional[_FetchResponse]:
     headers = {
@@ -463,7 +501,17 @@ async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = REQUEST
                         text = content.decode("utf-8", errors="replace")
                     return _FetchResponse(text=text, content=content)
                 if resp.status in (429, 500, 502, 503, 504) and attempt < attempts - 1:
-                    await asyncio.sleep(1.2 * (attempt + 1))
+                    delay = 1.2 * (attempt + 1)
+                    if resp.status == 429:
+                        # Honoring the server's actual requested delay (capped, so one
+                        # slow server can't eat a large share of the domain's time
+                        # budget) is the standard-compliant behavior for a 429 — this
+                        # is what separates a well-behaved crawler from one that just
+                        # hammers through rate limits with a fixed backoff.
+                        retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                        if retry_after is not None:
+                            delay = min(retry_after, MAX_RETRY_AFTER_SECONDS)
+                    await asyncio.sleep(delay)
                     continue
                 return None
         except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -489,15 +537,22 @@ async def probe_domain_reachable(base_url: str, proxy: Optional[str] = None) -> 
     normally on the very next attempt — an ordinary transient network blip,
     not a dead site). Worst case for a genuinely dead domain is now
     2x FAST_FAIL_PROBE_TIMEOUT instead of 1x, still far cheaper than the
-    multi-attempt path it's replacing."""
+    multi-attempt path it's replacing.
+
+    A short delay before the retry (rather than an immediate back-to-back
+    second attempt) gives a genuinely transient failure — a DNS resolver
+    hiccup, a momentary connection refusal — a real chance to have cleared,
+    rather than just re-asking the same question a few milliseconds later."""
     timeout = aiohttp.ClientTimeout(total=FAST_FAIL_PROBE_TIMEOUT)
-    for _ in range(2):
+    for attempt in range(2):
         try:
             async with new_client_session(timeout) as session:
                 async with session.get(base_url, headers={"User-Agent": random.choice(USER_AGENTS)},
                                         allow_redirects=True, proxy=proxy):
                     return True
         except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt == 0:
+                await asyncio.sleep(1.5)
             continue
     return False
 
@@ -1393,7 +1448,7 @@ def _check_playwright_installed() -> None:
 async def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
                      proxies_path: Optional[str] = None, verify_mx: bool = False,
                      use_playwright: bool = False, respect_robots: bool = True,
-                     resume: bool = False) -> None:
+                     resume: bool = False, retry_failed: bool = False) -> None:
     domains = load_domains(input_path)
     proxies = load_proxies(proxies_path)
 
@@ -1429,13 +1484,41 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
             writer.writeheader()
             f.flush()
 
+        retryable_urls = []
         async for done_count, total, r in process_domains_streaming(
             domains, max_workers, delay, proxies, verify_mx, use_playwright, respect_robots
         ):
             writer.writerow(result_to_row(r))
             f.flush()
+            if retry_failed and r.method == "none":
+                retryable_urls.append(r.input_url)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
             print(f"[{done_count}/{total}] {r.domain or r.input_url}: {status}", flush=True)
+
+        if retry_failed and retryable_urls:
+            # method == "none" covers connection-class failures (unreachable,
+            # homepage fetch failed, hard timeout) — the kind that can be a
+            # transient blip or temporary rate-limiting rather than a
+            # permanent block. Domains that DID connect but genuinely have no
+            # email ("no emails found on checked pages") are excluded:
+            # retrying won't change a real absence of contact info. A cooldown
+            # before the retry pass gives any temporary throttling a real
+            # chance to have cleared, and a lower worker count is gentler on
+            # whatever triggered it in the first place.
+            print(f"Retrying {len(retryable_urls)} domain(s) that failed to connect "
+                  f"(cooling down {RETRY_COOLDOWN_SECONDS:.0f}s first)...", flush=True)
+            await asyncio.sleep(RETRY_COOLDOWN_SECONDS)
+            retry_workers = max(1, min(max_workers, RETRY_MAX_WORKERS))
+            retry_count = 0
+            async for _done, _total, r in process_domains_streaming(
+                retryable_urls, retry_workers, delay, proxies, verify_mx, use_playwright, respect_robots
+            ):
+                writer.writerow(result_to_row(r))
+                f.flush()
+                retry_count += 1
+                status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
+                print(f"[retry {retry_count}/{len(retryable_urls)}] {r.domain or r.input_url}: {status}",
+                      flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -1463,6 +1546,11 @@ def main():
                          help="If --output already has rows from a previous (e.g. interrupted) "
                               "run, skip domains already recorded in it and append new results "
                               "instead of overwriting the file.")
+    parser.add_argument("--retry-failed", action="store_true",
+                         help="After the main batch, re-attempt (once, at lower concurrency, "
+                              "after a cooldown) domains that failed to connect at all — "
+                              "catches transient network blips and temporary rate-limiting. "
+                              "Does not retry domains that connected fine but had no email.")
     args = parser.parse_args()
 
     asyncio.run(run_batch(
@@ -1475,6 +1563,7 @@ def main():
         use_playwright=args.use_playwright,
         respect_robots=not args.ignore_robots,
         resume=args.resume,
+        retry_failed=args.retry_failed,
     ))
 
 

@@ -346,5 +346,38 @@ class TestProcessDomainsHardTimeout(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gave up after", results["stuck.com"].error)
 
 
+class TestParseRetryAfter(unittest.TestCase):
+    def test_none_returns_none(self):
+        self.assertIsNone(es._parse_retry_after(None))
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(es._parse_retry_after(""))
+
+    def test_integer_seconds(self):
+        self.assertEqual(es._parse_retry_after("120"), 120.0)
+
+    def test_integer_seconds_with_whitespace(self):
+        self.assertEqual(es._parse_retry_after("  30  "), 30.0)
+
+    def test_http_date_in_future(self):
+        from datetime import datetime, timedelta, timezone
+        future = datetime.now(timezone.utc) + timedelta(seconds=60)
+        header_value = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        delay = es._parse_retry_after(header_value)
+        self.assertIsNotNone(delay)
+        # Allow a few seconds of slack for test execution time.
+        self.assertTrue(50 <= delay <= 65, f"expected ~60s, got {delay}")
+
+    def test_http_date_in_past_clamps_to_zero(self):
+        from datetime import datetime, timedelta, timezone
+        past = datetime.now(timezone.utc) - timedelta(seconds=60)
+        header_value = past.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        delay = es._parse_retry_after(header_value)
+        self.assertEqual(delay, 0.0)
+
+    def test_garbage_value_returns_none(self):
+        self.assertIsNone(es._parse_retry_after("not a valid value at all"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

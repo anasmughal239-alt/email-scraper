@@ -136,7 +136,7 @@ domains_text = st.text_area(
     placeholder="example.com\nhttps://www.example.org\n# lines starting with # are ignored",
 )
 
-col_run, col_fresh = st.columns([1, 3])
+col_run, col_fresh, col_retry = st.columns([1, 2, 2])
 with col_run:
     run_clicked = st.button("Run scraper", type="primary")
 with col_fresh:
@@ -146,12 +146,20 @@ with col_fresh:
              "skipping domains already saved to disk and appending the rest. Tick this "
              "to discard that saved progress and scrape the whole list again.",
     )
+with col_retry:
+    retry_failed = st.checkbox(
+        "Retry failed domains after this run", value=False,
+        help="After the main run, re-attempt (once, at lower concurrency, after a "
+             "cooldown) domains that failed to connect at all — catches transient "
+             "network blips and temporary rate-limiting. Does not retry domains that "
+             "connected fine but genuinely had no email.",
+    )
 
 
 async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_playwright,
                            respect_robots, csv_path, write_header, prior_done, total_all,
                            progress_bar, status_text, timer_text, table_placeholder,
-                           start_time):
+                           start_time, retry_failed=False):
     """Streams each result to csv_path on disk (flushing every row) as it
     completes, so a crash / browser disconnect / Streamlit rerun loses
     nothing — the file is the source of truth, and a later run of the same
@@ -174,6 +182,7 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
             writer.writeheader()
             f.flush()
 
+        retryable_urls = []
         async for _done, _total, r in es.process_domains_streaming(
             domains, max_workers, delay, proxies, verify_mx, use_playwright, respect_robots
         ):
@@ -186,6 +195,8 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 emails_found += 1
             if r.error:
                 errors += 1
+            if retry_failed and r.method == "none":
+                retryable_urls.append(r.input_url)
             recent.appendleft(row)
 
             completed_all = prior_done + done
@@ -204,6 +215,32 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 f"{emails_found} with email, {errors} errors (this run)"
             )
             table_placeholder.dataframe(pd.DataFrame(list(recent)), width='stretch')
+
+        if retry_failed and retryable_urls:
+            # method == "none" covers connection-class failures (unreachable,
+            # homepage fetch failed, hard timeout) — the kind that can be a
+            # transient blip rather than a permanent block. Domains that
+            # connected fine but genuinely had no email are excluded, since
+            # retrying wouldn't change that outcome.
+            status_text.text(f"Cooling down {es.RETRY_COOLDOWN_SECONDS:.0f}s before retrying "
+                              f"{len(retryable_urls)} domain(s) that failed to connect...")
+            await asyncio.sleep(es.RETRY_COOLDOWN_SECONDS)
+            retry_workers = max(1, min(max_workers, es.RETRY_MAX_WORKERS))
+            retry_total = len(retryable_urls)
+            retry_done = 0
+            async for _done, _total, r in es.process_domains_streaming(
+                retryable_urls, retry_workers, delay, proxies, verify_mx, use_playwright, respect_robots
+            ):
+                row = es.result_to_row(r)
+                writer.writerow(row)
+                f.flush()
+                retry_done += 1
+                if r.emails:
+                    emails_found += 1
+                recent.appendleft(row)
+                status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
+                status_text.text(f"[retry {retry_done}/{retry_total}] {r.domain or r.input_url}: {status}")
+                table_placeholder.dataframe(pd.DataFrame(list(recent)), width='stretch')
     return done
 
 
@@ -274,6 +311,7 @@ if run_clicked:
             remaining, workers, delay, proxies, verify_mx, use_playwright, respect_robots,
             csv_path, write_header, prior_done, total_all,
             progress_bar, status_text, timer_text, table_placeholder, start_time,
+            retry_failed=retry_failed,
         ))
 
         total_elapsed = time.time() - start_time

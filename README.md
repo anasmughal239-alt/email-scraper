@@ -41,6 +41,7 @@ Options:
 | `--use-playwright` | off | retry with headless Chromium when a domain's static fetch finds zero emails (needs `playwright`, see below) |
 | `--ignore-robots` | off (robots honored) | do **not** honor `robots.txt` Disallow rules — only for sites you own or have permission to crawl |
 | `--resume` | off | if `--output` already has rows from a previous (e.g. interrupted) run, skip domains already recorded in it and append new results instead of overwriting the file |
+| `--retry-failed` | off | after the main batch, re-attempt (once, at lower concurrency, after a cooldown) domains that failed to connect at all — catches transient network blips and temporary rate-limiting. Does not retry domains that connected fine but had no email |
 
 Output CSV columns: `input_url, domain, primary_email, primary_role, own_domain_emails, other_domain_emails, method, source_pages, error`.
 
@@ -205,7 +206,22 @@ without tying up your own machine.
   render time stay flat even across thousands of domains — this is what
   makes a single large (e.g. 2000+ domain) job safe. `runs/` is gitignored;
   note it's ephemeral across a full Railway redeploy, so download the CSV
-  once a big job finishes.
+  once a big job finishes. Both the CLI (`--retry-failed`) and the
+  dashboard ("Retry failed domains after this run") support an optional
+  end-of-batch retry pass: after the main run, domains that failed to
+  connect at all (not ones that connected fine but had no email) are
+  re-attempted once, at lower concurrency, after a 15s cooldown — catches
+  transient network blips and temporary rate-limiting without retrying
+  domains where a retry can't change the outcome.
+- **Respectful of 429/rate-limiting.** A 429 response is retried using the
+  server's actual `Retry-After` value (capped at 15s) rather than a fixed
+  backoff — the standard-compliant behavior for a well-behaved crawler,
+  distinct from techniques meant to evade rate limiting.
+- **Large response headers are handled.** aiohttp's default header-size
+  limit (8190 bytes) is too small for some real e-commerce sites with
+  large Content-Security-Policy headers (many third-party script domains
+  listed) — this previously caused a fully reachable site to be reported
+  as unreachable. Raised to 64KB.
 - **JavaScript-rendered footers** are handled by the optional `--use-playwright`
   / `use_playwright=True` fallback (see above). It's opt-in and only triggers
   per-domain when the static pass finds nothing, since it's much slower.
