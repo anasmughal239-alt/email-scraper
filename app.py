@@ -85,10 +85,22 @@ with st.sidebar:
              "the sites or have permission to crawl them.",
     )
     use_playwright = st.checkbox(
-        "Use Playwright fallback (JS-rendered footers)", value=False,
-        help="Retries with a headless browser when a domain finds zero emails. "
-             "Much slower per domain, and requires 'playwright install chromium' "
-             "to have been run on this machine — not available on most free cloud hosts.",
+        "Force Playwright on every no-email domain (manual override)", value=False,
+        help="Forces a headless-browser retry on EVERY domain that finds zero emails "
+             "during the main pass, including connection failures it can't help with. "
+             "Much slower and heavier at batch scale — the automatic second pass below "
+             "is the targeted, cheaper default. Requires 'playwright install chromium' "
+             "to have been run on this machine — not available on most free cloud hosts. "
+             "Enabling this disables the automatic second pass (redundant otherwise).",
+    )
+    playwright_second_pass = st.checkbox(
+        "Auto-retry genuinely-empty domains with Playwright after the batch", value=True,
+        help="After the batch (and any --retry-failed pass) completes, domains whose "
+             "pages fetched fine but truly found nothing (no email, no salvage) get "
+             "Playwright applied once, targeted just at them — not connection failures, "
+             "not domains that already salvaged a phone/social. This is the recommended "
+             "default; disable if this host doesn't have Playwright/Chromium installed.",
+        disabled=use_playwright,
     )
     proxies_text = st.text_area(
         "Proxies (optional, one per line)", height=80, key="proxies_text",
@@ -162,7 +174,7 @@ with col_retry:
 async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_playwright,
                            respect_robots, csv_path, write_header, prior_done, total_all,
                            progress_bar, status_text, timer_text, table_placeholder,
-                           start_time, retry_failed=False):
+                           start_time, retry_failed=False, playwright_second_pass=False):
     """Streams each result to csv_path on disk (flushing every row) as it
     completes, so a crash / browser disconnect / Streamlit rerun loses
     nothing — the file is the source of truth, and a later run of the same
@@ -179,7 +191,7 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
     done = 0
     emails_found = 0
     errors = 0
-    latest_category_by_url: dict = {}
+    latest_result_by_url: dict = {}
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=es.CSV_FIELDNAMES)
         if write_header:
@@ -199,7 +211,7 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 emails_found += 1
             if r.error:
                 errors += 1
-            latest_category_by_url[r.input_url] = es.classify_domain_result(r)
+            latest_result_by_url[r.input_url] = r
             if retry_failed and (r.method == "none" or r.fetch_failed):
                 retryable_urls.append(r.input_url)
             recent.appendleft(row)
@@ -242,11 +254,36 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 retry_done += 1
                 if r.emails:
                     emails_found += 1
-                latest_category_by_url[r.input_url] = es.classify_domain_result(r)
+                latest_result_by_url[r.input_url] = r
                 recent.appendleft(row)
                 status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
                 status_text.text(f"[retry {retry_done}/{retry_total}] {r.domain or r.input_url}: {status}")
                 table_placeholder.dataframe(pd.DataFrame(list(recent)), width='stretch')
+
+        if playwright_second_pass:
+            pw_targets = [
+                r for r in latest_result_by_url.values()
+                if es.classify_domain_result(r) == "genuine_no_result"
+            ]
+            if pw_targets:
+                status_text.text(f"Running Playwright on {len(pw_targets)} domain(s) with "
+                                  "genuinely no result (targeted second pass)...")
+                pw_done = 0
+                async for r in es.run_playwright_second_pass(pw_targets, delay):
+                    row = es.result_to_row(r)
+                    writer.writerow(row)
+                    f.flush()
+                    pw_done += 1
+                    if r.emails:
+                        emails_found += 1
+                    latest_result_by_url[r.input_url] = r
+                    recent.appendleft(row)
+                    status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
+                    status_text.text(f"[playwright {pw_done}/{len(pw_targets)}] "
+                                      f"{r.domain or r.input_url}: {status}")
+                    table_placeholder.dataframe(pd.DataFrame(list(recent)), width='stretch')
+
+    latest_category_by_url = {u: es.classify_domain_result(r) for u, r in latest_result_by_url.items()}
     return done, latest_category_by_url
 
 
@@ -285,6 +322,19 @@ if run_clicked:
                 "or uncheck the option to continue without it."
             )
             st.stop()
+        # Already forced on every no-email domain during the main pass —
+        # the automatic second pass afterward would just redo the same work.
+        effective_second_pass = False
+    elif playwright_second_pass:
+        try:
+            import playwright.async_api  # noqa: F401
+            effective_second_pass = True
+        except ImportError:
+            st.info("Playwright isn't installed on this host — skipping the automatic "
+                     "no-result second pass (the rest of the batch runs normally).")
+            effective_second_pass = False
+    else:
+        effective_second_pass = False
 
     csv_path = _job_csv_path(domains)
     st.session_state.job_csv_path = csv_path
@@ -317,7 +367,7 @@ if run_clicked:
             remaining, workers, delay, proxies, verify_mx, use_playwright, respect_robots,
             csv_path, write_header, prior_done, total_all,
             progress_bar, status_text, timer_text, table_placeholder, start_time,
-            retry_failed=retry_failed,
+            retry_failed=retry_failed, playwright_second_pass=effective_second_pass,
         ))
 
         total_elapsed = time.time() - start_time

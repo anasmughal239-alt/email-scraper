@@ -723,5 +723,66 @@ class TestBatchHistoryLog(unittest.TestCase):
         self.assertEqual(history[0]["total"], 1)
 
 
+class TestPlaywrightSecondPassTargeting(unittest.IsolatedAsyncioTestCase):
+    """The automatic default second pass must apply Playwright ONLY to
+    domains whose final category is genuine_no_result — not connection
+    failures (nothing to retry Playwright against usefully) and not
+    salvage_only (already found something, don't waste a browser launch)."""
+
+    async def test_only_genuine_no_result_domains_get_playwright(self):
+        email_found = es.DomainResult(input_url="https://a.com")
+        email_found.emails = {"hi@a.com"}
+
+        connection_failed = es.DomainResult(input_url="https://b.com")
+        connection_failed.method = "none"
+
+        salvage_only = es.DomainResult(input_url="https://c.com")
+        salvage_only.method = "sitemap"
+        salvage_only.phones = {"+1234"}
+
+        genuine_no_result = es.DomainResult(input_url="https://d.com")
+        genuine_no_result.method = "sitemap"
+        genuine_no_result.base_url = "https://d.com"
+        genuine_no_result.pages_checked = ["https://d.com/contact"]
+
+        all_results = [email_found, connection_failed, salvage_only, genuine_no_result]
+        targets = [r for r in all_results if es.classify_domain_result(r) == "genuine_no_result"]
+        self.assertEqual(targets, [genuine_no_result])
+
+        calls = []
+
+        async def fake_playwright_fallback(result, base_url, pages_to_check, delay,
+                                            salvage_phones, salvage_whatsapp, salvage_social):
+            calls.append(result.input_url)
+
+        with unittest.mock.patch.object(es, "playwright_fallback", fake_playwright_fallback):
+            processed = [r async for r in es.run_playwright_second_pass(targets, delay=0)]
+
+        self.assertEqual(calls, ["https://d.com"])
+        self.assertEqual([r.input_url for r in processed], ["https://d.com"])
+
+    async def test_reuses_stored_pages_checked_not_rediscovered(self):
+        # The whole point of storing base_url/pages_checked is that the
+        # second pass doesn't redo sitemap discovery — verify it's actually
+        # passed through to playwright_fallback unchanged.
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        r.base_url = "https://x.com"
+        r.pages_checked = ["https://x.com/contact", "https://x.com/about"]
+
+        seen_args = {}
+
+        async def fake_playwright_fallback(result, base_url, pages_to_check, delay,
+                                            salvage_phones, salvage_whatsapp, salvage_social):
+            seen_args["base_url"] = base_url
+            seen_args["pages_to_check"] = pages_to_check
+
+        with unittest.mock.patch.object(es, "playwright_fallback", fake_playwright_fallback):
+            await es.apply_playwright_to_result(r, delay=0)
+
+        self.assertEqual(seen_args["base_url"], "https://x.com")
+        self.assertEqual(seen_args["pages_to_check"], ["https://x.com/contact", "https://x.com/about"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

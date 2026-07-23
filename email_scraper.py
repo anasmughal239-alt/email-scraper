@@ -422,6 +422,14 @@ class DomainResult:
     phones: set = field(default_factory=set)
     whatsapp_links: set = field(default_factory=set)
     social_links: set = field(default_factory=set)
+    # Remembers the normalized base URL and exactly which candidate pages
+    # this pass checked, so an automatic Playwright second pass (targeted at
+    # domains that land in the "genuine_no_result" bucket — see
+    # classify_domain_result) can reuse them directly instead of redoing
+    # sitemap discovery + ranking from scratch, which would confound any
+    # measurement of Playwright's own cost with redundant re-scraping cost.
+    base_url: str = ""
+    pages_checked: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -1450,6 +1458,7 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                           use_playwright: bool = False, respect_robots: bool = True) -> DomainResult:
     result = DomainResult(input_url=raw_url)
     base_url = normalize_to_base_url(raw_url)
+    result.base_url = base_url
     result.domain = get_bare_domain(base_url)
     if not result.domain:
         result.error = "could not parse domain"
@@ -1504,9 +1513,10 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                     _maybe_apply_salvage(result, phones, whatsapp_links, social_links)
                 return result
 
+            result.pages_checked = pages_to_check[:MAX_PAGES_PER_DOMAIN]
             emails, source_pages, fetched_ok, fetch_failed_count, phones, whatsapp_links, social_links = (
                 await fetch_and_extract_pages(
-                    session, pages_to_check[:MAX_PAGES_PER_DOMAIN], robots, delay, proxy
+                    session, result.pages_checked, robots, delay, proxy
                 )
             )
             result.emails |= emails
@@ -1525,6 +1535,7 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                  hop_phones, hop_whatsapp, hop_social) = await fetch_and_extract_pages(
                     session, second_hop_urls, robots, delay, proxy
                 )
+                result.pages_checked += [u for u in second_hop_urls if u not in result.pages_checked]
                 result.emails |= emails
                 result.source_pages |= source_pages
                 total_fetched_ok += fetched_ok
@@ -1777,10 +1788,49 @@ def _check_playwright_installed() -> None:
         )
 
 
+async def apply_playwright_to_result(r: "DomainResult", delay: float) -> "DomainResult":
+    """Re-applies Playwright to an already-processed domain, reusing its
+    stored base_url/pages_checked instead of redoing sitemap discovery and
+    ranking — the whole point of storing them was to keep a later targeted
+    pass cheap, not just correct."""
+    phones, whatsapp_links, social_links = set(r.phones), set(r.whatsapp_links), set(r.social_links)
+    await playwright_fallback(r, r.base_url, r.pages_checked, delay, phones, whatsapp_links, social_links)
+    _maybe_apply_salvage(r, phones, whatsapp_links, social_links)
+    return r
+
+
+async def run_playwright_second_pass(targets: list, delay: float) -> AsyncIterator["DomainResult"]:
+    """The automatic *default* Playwright behavior: after a batch's static
+    pipeline (and any --retry-failed pass) completes, domains whose final
+    category is "genuine_no_result" — pages fetched fine, but truly
+    nothing (no email, no phone/WhatsApp/social) was found — get Playwright
+    applied once, targeted just at them.
+
+    This is deliberately narrower than use_playwright=True, which forces
+    Playwright on every no-email domain during the main pass, including
+    ones that never even connected or that already yielded a salvageable
+    phone/social — paying a full headless-Chromium launch for domains it
+    can't possibly help. use_playwright=True remains a manual override for
+    forcing it on everything; when set, this automatic pass is skipped
+    entirely as redundant (Playwright already ran for every such domain
+    during the main pass in that case).
+
+    Concurrent asyncio tasks are fine here despite MAX_CONCURRENT_PLAYWRIGHT_INSTANCES
+    limiting actual browser instances to 1 at a time — playwright_fallback's
+    own semaphore already serializes real Chromium usage; this just queues
+    the requests for it instead of running them one Python call at a time."""
+    async def _apply(r: "DomainResult") -> "DomainResult":
+        return await apply_playwright_to_result(r, delay)
+
+    for coro in asyncio.as_completed([_apply(r) for r in targets]):
+        yield await coro
+
+
 async def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
                      proxies_path: Optional[str] = None, verify_mx: bool = False,
                      use_playwright: bool = False, respect_robots: bool = True,
                      resume: bool = False, retry_failed: bool = False,
+                     playwright_second_pass: bool = True,
                      history_log_path: str = DEFAULT_BATCH_HISTORY_LOG) -> None:
     domains = load_domains(input_path)
     proxies = load_proxies(proxies_path)
@@ -1798,6 +1848,18 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
 
     if use_playwright:
         _check_playwright_installed()
+        # Already forced on every no-email domain during the main pass —
+        # running the automatic targeted pass afterward would just redo the
+        # same domains for no benefit.
+        playwright_second_pass = False
+    elif playwright_second_pass:
+        try:
+            _check_playwright_installed()
+        except RuntimeError:
+            print("Playwright not installed — skipping the automatic no-result second pass "
+                  "(run: pip install playwright && playwright install chromium to enable it).",
+                  flush=True)
+            playwright_second_pass = False
 
     file_mode = "w"
     write_header = True
@@ -1818,13 +1880,13 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
             f.flush()
 
         retryable_urls = []
-        latest_category_by_url: dict = {}
+        latest_result_by_url: dict = {}
         async for done_count, total, r in process_domains_streaming(
             domains, max_workers, delay, proxies, verify_mx, use_playwright, respect_robots
         ):
             writer.writerow(result_to_row(r))
             f.flush()
-            latest_category_by_url[r.input_url] = classify_domain_result(r)
+            latest_result_by_url[r.input_url] = r
             if retry_failed and (r.method == "none" or r.fetch_failed):
                 retryable_urls.append(r.input_url)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
@@ -1852,13 +1914,31 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
             ):
                 writer.writerow(result_to_row(r))
                 f.flush()
-                latest_category_by_url[r.input_url] = classify_domain_result(r)
+                latest_result_by_url[r.input_url] = r
                 retry_count += 1
                 status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
                 print(f"[retry {retry_count}/{len(retryable_urls)}] {r.domain or r.input_url}: {status}",
                       flush=True)
 
-    summary = summarize_batch(latest_category_by_url)
+        if playwright_second_pass:
+            pw_targets = [
+                r for r in latest_result_by_url.values()
+                if classify_domain_result(r) == "genuine_no_result"
+            ]
+            if pw_targets:
+                print(f"Running Playwright on {len(pw_targets)} domain(s) with genuinely no "
+                      "result (targeted second pass, not forced on every domain)...", flush=True)
+                pw_done = 0
+                async for r in run_playwright_second_pass(pw_targets, delay):
+                    writer.writerow(result_to_row(r))
+                    f.flush()
+                    latest_result_by_url[r.input_url] = r
+                    pw_done += 1
+                    status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
+                    print(f"[playwright {pw_done}/{len(pw_targets)}] {r.domain or r.input_url}: {status}",
+                          flush=True)
+
+    summary = summarize_batch({u: classify_domain_result(r) for u, r in latest_result_by_url.items()})
     log_batch_summary(summary, history_log_path)
     print(f"Batch summary: {summary['total']} domain(s) — "
           f"{summary['email_found']} with email, "
@@ -1903,6 +1983,14 @@ def main():
                               f"summary gets appended to after every batch (default: "
                               f"{DEFAULT_BATCH_HISTORY_LOG}), so trends are visible across "
                               "runs over time.")
+    parser.add_argument("--no-playwright-second-pass", action="store_true",
+                         help="Disable the automatic default second pass, where domains "
+                              "landing in the 'genuinely no result' bucket (pages fetched "
+                              "fine, nothing found at all — not connection failures, not "
+                              "salvage-only) automatically get Playwright applied once after "
+                              "the batch. On by default; --use-playwright (forces Playwright "
+                              "on every no-email domain during the main pass instead) already "
+                              "supersedes this and disables it automatically.")
     args = parser.parse_args()
 
     asyncio.run(run_batch(
@@ -1916,6 +2004,7 @@ def main():
         respect_robots=not args.ignore_robots,
         resume=args.resume,
         retry_failed=args.retry_failed,
+        playwright_second_pass=not args.no_playwright_second_pass,
         history_log_path=args.history_log,
     ))
 
