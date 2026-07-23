@@ -1,4 +1,9 @@
 aiohttp>=3.9
+# Powers AsyncResolver (native async DNS via c-ares) on Linux/Mac hosts
+# (Railway, Streamlit Cloud) — eliminates the zombie-thread risk that
+# ThreadedResolver has under concurrent slow-DNS conditions. Only used when
+# not on Windows; see _new_resolver() in email_scraper.py for why.
+aiodns>=3.2
 beautifulsoup4>=4.12
 lxml>=5.2
 dnspython>=2.6

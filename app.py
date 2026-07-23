@@ -195,7 +195,7 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 emails_found += 1
             if r.error:
                 errors += 1
-            if retry_failed and r.method == "none":
+            if retry_failed and (r.method == "none" or r.fetch_failed):
                 retryable_urls.append(r.input_url)
             recent.appendleft(row)
 

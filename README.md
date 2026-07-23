@@ -212,7 +212,22 @@ without tying up your own machine.
   connect at all (not ones that connected fine but had no email) are
   re-attempted once, at lower concurrency, after a 15s cooldown — catches
   transient network blips and temporary rate-limiting without retrying
-  domains where a retry can't change the outcome.
+  domains where a retry can't change the outcome. This distinction is real,
+  not string-matched: a domain whose candidate pages were identified but
+  *all* failed to fetch (`error: "pages failed to fetch..."`) is retried the
+  same as an outright-unreachable one; a domain whose pages fetched fine
+  and genuinely had no email (`error: "no emails found on checked
+  pages"`) is not — these used to look identical, which silently made
+  `--retry-failed` skip exactly the connection failures it was built to
+  catch.
+- **DNS resolution.** Uses `aiohttp`'s native async `AsyncResolver`
+  (`aiodns`/c-ares) on Linux/Mac hosts (Railway, Streamlit Cloud) — a hung
+  DNS lookup is genuinely cancellable, unlike the alternative
+  (`ThreadedResolver`), where the underlying OS thread can't be forcibly
+  killed and keeps occupying a shared executor slot until it eventually
+  returns. Falls back to `ThreadedResolver` on Windows, where `aiodns`'s
+  c-ares resolver is known to fail outright in local dev — see
+  `_new_resolver()` in `email_scraper.py`.
 - **Respectful of 429/rate-limiting.** A 429 response is retried using the
   server's actual `Retry-After` value (capped at 15s) rather than a fixed
   backoff — the standard-compliant behavior for a well-behaved crawler,

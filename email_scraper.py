@@ -36,6 +36,7 @@ import gzip
 import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -45,7 +46,7 @@ from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
 import aiohttp
-from aiohttp.resolver import ThreadedResolver
+from aiohttp.resolver import AsyncResolver, ThreadedResolver
 from bs4 import BeautifulSoup
 
 # --------------------------------------------------------------------------
@@ -392,6 +393,14 @@ class DomainResult:
     source_pages: set = field(default_factory=set)
     method: str = ""       # sitemap | homepage-fallback | none
     error: str = ""
+    # True when candidate pages were identified (method is "sitemap" or
+    # "homepage-fallback") but every single one failed to fetch — distinct
+    # from pages that fetched fine and genuinely had no email. Before this
+    # field existed, both cases produced the identical
+    # error="no emails found on checked pages", which meant --retry-failed
+    # (built specifically to retry connection-class failures) silently
+    # skipped exactly this case, since it only ever checked method=="none".
+    fetch_failed: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -420,17 +429,39 @@ async def _run_cpu(func, *args):
     return await loop.run_in_executor(None, func, *args)
 
 
+def _new_resolver():
+    """ThreadedResolver (wraps blocking socket.getaddrinfo in a background
+    thread) has a real, documented cost: if a DNS lookup hangs, asyncio's own
+    timeout can abandon the *coroutine*, but the underlying OS thread doing
+    the actual blocking call cannot be forcibly killed — it keeps occupying
+    an executor slot (shared with this module's own CPU-bound parsing, see
+    _run_cpu) until the OS-level call eventually returns, which can degrade
+    a whole batch's throughput under concurrent slow-DNS conditions.
+    AsyncResolver (aiodns/c-ares) resolves this properly: DNS lookups happen
+    natively async, with no thread and no zombie-thread risk at all.
+
+    But aiodns's c-ares resolver is known to fail outright on Windows in
+    this exact dev environment (ClientConnectorDNSError: "Could not contact
+    DNS servers") even though plain socket.getaddrinfo works fine here — a
+    documented aiohttp+aiodns+Windows footgun, not a hypothetical concern.
+    Railway and Streamlit Cloud both run Linux, where aiodns/c-ares works
+    normally. So: AsyncResolver on non-Windows (where it actually works and
+    eliminates the zombie-thread problem for real), ThreadedResolver on
+    Windows (where AsyncResolver is known broken) — with a defensive
+    fallback to ThreadedResolver if AsyncResolver construction fails for any
+    other reason too (e.g. aiodns missing from the environment), so a
+    resolver problem anywhere else degrades gracefully instead of crashing
+    every request outright."""
+    if sys.platform != "win32":
+        try:
+            return AsyncResolver()
+        except Exception:
+            pass
+    return ThreadedResolver()
+
+
 def _new_connector() -> aiohttp.TCPConnector:
-    """Explicitly force aiohttp's plain ThreadedResolver (a background-thread
-    wrapper around socket.getaddrinfo) instead of letting aiohttp
-    auto-select AsyncResolver whenever the optional 'aiodns' package happens
-    to be installed. aiodns's c-ares resolver failed outright on this
-    project's Windows dev machine (ClientConnectorDNSError: "Could not
-    contact DNS servers") even though the same lookups work fine via plain
-    socket.getaddrinfo — a known aiohttp+aiodns+Windows footgun. Forcing
-    ThreadedResolver keeps behavior identical and reliable across platforms
-    rather than depending on which optional packages happen to be present."""
-    return aiohttp.TCPConnector(resolver=ThreadedResolver())
+    return aiohttp.TCPConnector(resolver=_new_resolver())
 
 
 # aiohttp's default header-size limits (max_line_size/max_field_size =
@@ -1124,6 +1155,7 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
     bounded memory ceiling regardless of --workers."""
     async with _playwright_semaphore:
         try:
+            fetched_any = False
             async with PlaywrightFetcher() as pf:
                 urls_to_try = pages_to_check or [base_url]
                 extra_links: list = []
@@ -1133,6 +1165,7 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
                     await asyncio.sleep(delay)
                     if not html:
                         continue
+                    fetched_any = True
                     if not pages_to_check:
                         # Homepage was previously unreachable/empty; now that we
                         # have JS-rendered HTML, look for contact links in it too.
@@ -1147,6 +1180,7 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
                     await asyncio.sleep(delay)
                     if not html:
                         continue
+                    fetched_any = True
                     found = await _run_cpu(extract_emails_from_html, html)
                     if found:
                         result.emails |= found
@@ -1155,6 +1189,14 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
             if result.emails:
                 result.method = f"{result.method}+playwright"
                 result.error = ""
+                result.fetch_failed = False
+            elif fetched_any:
+                # Playwright genuinely retrieved JS-rendered content (unlike
+                # the static pass, which may have set fetch_failed=True) and
+                # still found nothing — a real "checked and empty" result now,
+                # regardless of what the static pass concluded.
+                result.fetch_failed = False
+                result.error = "no emails found on checked pages (incl. JS-rendered)"
             else:
                 result.error = result.error or "no emails found on checked pages (incl. JS-rendered)"
 
@@ -1175,19 +1217,26 @@ async def fetch_and_extract_pages(session: aiohttp.ClientSession, urls: list, ro
     of each other, so there's no reason to wait for one before starting the
     next) and extracts emails from each. `delay` staggers when each fetch
     *starts* rather than serializing them — a soft rate limit that still
-    lets slow pages run in the background instead of blocking faster ones."""
+    lets slow pages run in the background instead of blocking faster ones.
+
+    Returns (emails, source_pages, fetched_ok_count, fetch_failed_count).
+    The last two exist specifically so the caller can tell "every candidate
+    page failed to fetch" (403/timeout/connection reset/exhausted retries)
+    apart from "pages fetched fine and genuinely had no email" — before this,
+    both looked identical (empty emails, empty source_pages), which silently
+    broke --retry-failed for exactly the case it was built to catch."""
     emails: set = set()
     source_pages: set = set()
     allowed_urls = [u for u in urls if robots.can_fetch(u)]
     if not allowed_urls:
-        return emails, source_pages
+        return emails, source_pages, 0, 0
 
     sem = asyncio.Semaphore(min(PER_DOMAIN_FETCH_WORKERS, len(allowed_urls)))
 
     async def _fetch_one(url: str) -> tuple:
         async with sem:
             resp = await fetch(session, url, proxy=proxy)
-        if not resp:
+        if resp is None:
             return url, None
         return url, await _run_cpu(extract_emails_from_html, resp.text)
 
@@ -1204,11 +1253,35 @@ async def fetch_and_extract_pages(session: aiohttp.ClientSession, urls: list, ro
     # already-closed aiohttp session in testing (RuntimeError: Session is
     # closed) once the parent's `async with ClientSession()` block exited.
     results = await asyncio.gather(*tasks)
+    fetched_ok = 0
+    fetch_failed = 0
     for url, found in results:
+        if found is None:
+            fetch_failed += 1
+            continue
+        fetched_ok += 1
         if found:
             emails |= found
             source_pages.add(url)
-    return emails, source_pages
+    return emails, source_pages, fetched_ok, fetch_failed
+
+
+def _decide_empty_result_status(pages_fetched_ok: int, pages_fetch_failed: int) -> tuple:
+    """Given the accumulated fetch outcome for a domain whose candidate
+    pages were identified but yielded no emails, decides whether that's a
+    genuine "checked and empty" result or a fetch failure masquerading as
+    one. Returns (fetch_failed: bool, error_message: str).
+
+    A pure function (plain integers in, no I/O) specifically so this
+    decision can be unit-tested directly without mocking any network calls —
+    the fetch outcome counting happens in fetch_and_extract_pages, this just
+    decides what it means."""
+    if pages_fetched_ok == 0 and pages_fetch_failed > 0:
+        return True, (
+            f"pages failed to fetch (0 of {pages_fetch_failed} candidate page(s) "
+            "returned a response — not a genuine \"no email\" result)"
+        )
+    return False, "no emails found on checked pages"
 
 
 async def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_mx: bool,
@@ -1264,11 +1337,13 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                     await playwright_fallback(result, base_url, pages_to_check, delay)
                 return result
 
-            found, source_pages = await fetch_and_extract_pages(
+            emails, source_pages, fetched_ok, fetch_failed_count = await fetch_and_extract_pages(
                 session, pages_to_check[:MAX_PAGES_PER_DOMAIN], robots, delay, proxy
             )
-            result.emails |= found
+            result.emails |= emails
             result.source_pages |= source_pages
+            total_fetched_ok = fetched_ok
+            total_fetch_failed = fetch_failed_count
 
             # Shallow second hop: sitemap + footer-keyword discovery both failed
             # to surface anything useful, so try a few more same-domain nav links
@@ -1277,9 +1352,22 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                 second_hop_urls = await _run_cpu(
                     find_second_hop_links, home_resp.text, base_url, set(pages_to_check)
                 )
-                found, source_pages = await fetch_and_extract_pages(session, second_hop_urls, robots, delay, proxy)
-                result.emails |= found
+                emails, source_pages, fetched_ok, fetch_failed_count = await fetch_and_extract_pages(
+                    session, second_hop_urls, robots, delay, proxy
+                )
+                result.emails |= emails
                 result.source_pages |= source_pages
+                total_fetched_ok += fetched_ok
+                total_fetch_failed += fetch_failed_count
+
+            # Decide (before Playwright, so Playwright can override it below if
+            # it manages to fetch real content the static pass couldn't) whether
+            # this domain's empty result means "every candidate page failed to
+            # fetch" versus "pages fetched fine and genuinely had no email."
+            if not result.emails:
+                result.fetch_failed, result.error = _decide_empty_result_status(
+                    total_fetched_ok, total_fetch_failed
+                )
 
             if not result.emails and use_playwright:
                 await playwright_fallback(result, base_url, pages_to_check, delay)
@@ -1490,14 +1578,16 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
         ):
             writer.writerow(result_to_row(r))
             f.flush()
-            if retry_failed and r.method == "none":
+            if retry_failed and (r.method == "none" or r.fetch_failed):
                 retryable_urls.append(r.input_url)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
             print(f"[{done_count}/{total}] {r.domain or r.input_url}: {status}", flush=True)
 
         if retry_failed and retryable_urls:
             # method == "none" covers connection-class failures (unreachable,
-            # homepage fetch failed, hard timeout) — the kind that can be a
+            # homepage fetch failed, hard timeout); fetch_failed covers the
+            # case where candidate pages WERE identified (method is "sitemap"
+            # or "homepage-fallback") but every one of them failed to fetch —
             # transient blip or temporary rate-limiting rather than a
             # permanent block. Domains that DID connect but genuinely have no
             # email ("no emails found on checked pages") are excluded:

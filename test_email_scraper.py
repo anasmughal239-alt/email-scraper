@@ -379,5 +379,130 @@ class TestParseRetryAfter(unittest.TestCase):
         self.assertIsNone(es._parse_retry_after("not a valid value at all"))
 
 
+class TestDecideEmptyResultStatus(unittest.TestCase):
+    """Regression: a domain where every candidate page failed to fetch
+    (403/timeout/connection reset/exhausted retries) and a domain that
+    fetched fine and genuinely had no email used to produce the identical
+    error="no emails found on checked pages" — indistinguishable, which
+    silently broke --retry-failed (built specifically to retry the former
+    case) since it only ever checked method=="none"."""
+
+    def test_all_pages_failed_to_fetch(self):
+        fetch_failed, message = es._decide_empty_result_status(
+            pages_fetched_ok=0, pages_fetch_failed=3
+        )
+        self.assertTrue(fetch_failed)
+        self.assertIn("failed to fetch", message)
+
+    def test_pages_fetched_fine_no_email(self):
+        fetch_failed, message = es._decide_empty_result_status(
+            pages_fetched_ok=3, pages_fetch_failed=0
+        )
+        self.assertFalse(fetch_failed)
+        self.assertEqual(message, "no emails found on checked pages")
+
+    def test_mixed_outcome_prefers_genuine_result(self):
+        # At least one page DID fetch successfully, so this is a genuine
+        # "checked and empty" result even though other candidates failed.
+        fetch_failed, _ = es._decide_empty_result_status(
+            pages_fetched_ok=1, pages_fetch_failed=2
+        )
+        self.assertFalse(fetch_failed)
+
+    def test_no_pages_attempted_at_all(self):
+        # Neither fetched nor failed (e.g. an empty candidate list reached
+        # this point somehow) — shouldn't claim a fetch failure that didn't
+        # happen.
+        fetch_failed, _ = es._decide_empty_result_status(
+            pages_fetched_ok=0, pages_fetch_failed=0
+        )
+        self.assertFalse(fetch_failed)
+
+
+class TestFetchAndExtractPagesDistinguishesFailureFromEmpty(unittest.IsolatedAsyncioTestCase):
+    """The counting half of the same regression: fetch_and_extract_pages()
+    must report *how many* candidate pages fetched successfully versus
+    failed outright, not just which pages happened to contain an email."""
+
+    async def test_every_fetch_fails(self):
+        async def fake_fetch_none(session, url, proxy=None):
+            return None
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch_none):
+            emails, source_pages, fetched_ok, fetch_failed = await es.fetch_and_extract_pages(
+                None, ["https://x.com/contact", "https://x.com/about"], robots, delay=0
+            )
+
+        self.assertEqual(emails, set())
+        self.assertEqual(source_pages, set())
+        self.assertEqual(fetched_ok, 0)
+        self.assertEqual(fetch_failed, 2)
+
+    async def test_fetches_succeed_but_page_has_no_email(self):
+        class FakeResp:
+            text = "<html><body>Just some ordinary page content, no address here.</body></html>"
+
+        async def fake_fetch_ok(session, url, proxy=None):
+            return FakeResp()
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch_ok):
+            emails, source_pages, fetched_ok, fetch_failed = await es.fetch_and_extract_pages(
+                None, ["https://x.com/contact"], robots, delay=0
+            )
+
+        self.assertEqual(emails, set())
+        self.assertEqual(source_pages, set())
+        self.assertEqual(fetched_ok, 1)
+        self.assertEqual(fetch_failed, 0)
+
+    async def test_mixed_some_fetch_some_dont(self):
+        class FakeResp:
+            text = "<p>reach us at hello@company-x.com</p>"
+
+        async def fake_fetch_mixed(session, url, proxy=None):
+            if "works" in url:
+                return FakeResp()
+            return None
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch_mixed):
+            emails, source_pages, fetched_ok, fetch_failed = await es.fetch_and_extract_pages(
+                None, ["https://x.com/works", "https://x.com/broken"], robots, delay=0
+            )
+
+        self.assertEqual(emails, {"hello@company-x.com"})
+        self.assertEqual(fetched_ok, 1)
+        self.assertEqual(fetch_failed, 1)
+
+
+class TestResolverSelection(unittest.IsolatedAsyncioTestCase):
+    """Regression: ThreadedResolver's blocking socket.getaddrinfo runs in a
+    background thread that can't be forcibly killed if a lookup hangs — a
+    zombie thread occupies an executor slot until the OS-level call itself
+    returns. AsyncResolver (aiodns) resolves DNS natively async with no
+    thread at all, but aiodns's c-ares resolver is known broken on Windows
+    in this dev environment, so the choice must be platform-conditional
+    rather than an unconditional swap. Async since AsyncResolver.__init__
+    requires a running event loop."""
+
+    async def test_windows_uses_threaded_resolver(self):
+        with unittest.mock.patch.object(es.sys, "platform", "win32"):
+            resolver = es._new_resolver()
+        self.assertIsInstance(resolver, es.ThreadedResolver)
+
+    async def test_non_windows_uses_async_resolver(self):
+        with unittest.mock.patch.object(es.sys, "platform", "linux"):
+            resolver = es._new_resolver()
+        self.assertIsInstance(resolver, es.AsyncResolver)
+
+    async def test_falls_back_to_threaded_if_async_resolver_unavailable(self):
+        with unittest.mock.patch.object(es.sys, "platform", "linux"), \
+                unittest.mock.patch.object(es, "AsyncResolver", side_effect=RuntimeError("no aiodns")):
+            resolver = es._new_resolver()
+        self.assertIsInstance(resolver, es.ThreadedResolver)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
