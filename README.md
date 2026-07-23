@@ -42,8 +42,33 @@ Options:
 | `--ignore-robots` | off (robots honored) | do **not** honor `robots.txt` Disallow rules — only for sites you own or have permission to crawl |
 | `--resume` | off | if `--output` already has rows from a previous (e.g. interrupted) run, skip domains already recorded in it and append new results instead of overwriting the file |
 | `--retry-failed` | off | after the main batch, re-attempt (once, at lower concurrency, after a cooldown) domains that failed to connect at all — catches transient network blips and temporary rate-limiting. Does not retry domains that connected fine but had no email |
+| `--history-log` | `batch_history.jsonl` | path to the append-only JSONL file a one-line hit-rate summary gets appended to after every batch, so trends are visible across runs over time |
 
-Output CSV columns: `input_url, domain, primary_email, primary_role, own_domain_emails, other_domain_emails, method, source_pages, error`.
+Output CSV columns: `input_url, domain, primary_email, primary_role, own_domain_emails, other_domain_emails, phone, whatsapp, social_links, method, source_pages, error`.
+
+### Salvage bucket (phone/WhatsApp/social)
+
+When a domain's pages fetch successfully but genuinely have no email
+(`fetch_failed` is false, `emails` is empty), the same already-fetched HTML
+is scanned for a phone number (`tel:` links, or a leading-`+` international
+format in visible text), WhatsApp links (`wa.me/...`, `whatsapp.com/send?
+phone=...`), and social profile links (Facebook/Instagram/LinkedIn/
+Twitter-X, with share-button/tracking-pixel noise excluded) — no new
+requests are made. These populate the `phone`/`whatsapp`/`social_links` CSV
+columns, so a domain with a salvaged phone/social but no email is clearly
+distinguishable from one with genuinely nothing (all blank) or one whose
+pages failed to fetch at all (also all blank, but `error` says so).
+
+### Per-batch hit-rate tracking
+
+Every batch (CLI and dashboard) appends one line to `--history-log`
+(default `batch_history.jsonl`; the dashboard uses `runs/batch_history.jsonl`)
+summarizing that run: how many domains had an email found, were salvage-only,
+genuinely had no result, or failed to connect at all. This is meant for
+trend visibility across many batches over time — check `--history-log`'s
+current default value or the dashboard's "History" expander after a run
+rather than relying on memory or one-off spot checks. The dashboard also
+shows the current run's summary as a set of metrics right after it finishes.
 
 ### Role-based ranking
 

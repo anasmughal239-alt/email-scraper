@@ -2,6 +2,7 @@ results.csv
 domains.txt
 proxies.txt
 retry_list.txt
+batch_history.jsonl
 runs/
 __pycache__/
 *.pyc

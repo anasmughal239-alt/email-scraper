@@ -26,6 +26,9 @@ import email_scraper as es
 # loses nothing and can be resumed. Gitignored; ephemeral on Railway across
 # a full redeploy, but survives the common case of the script/session dying.
 RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+# Same directory/persistence caveats as the per-job CSVs above: survives
+# the container's lifetime, wiped on a full redeploy.
+BATCH_HISTORY_PATH = os.path.join(RUNS_DIR, "batch_history.jsonl")
 
 
 def _job_csv_path(domains: list) -> str:
@@ -176,6 +179,7 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
     done = 0
     emails_found = 0
     errors = 0
+    latest_category_by_url: dict = {}
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=es.CSV_FIELDNAMES)
         if write_header:
@@ -195,6 +199,7 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 emails_found += 1
             if r.error:
                 errors += 1
+            latest_category_by_url[r.input_url] = es.classify_domain_result(r)
             if retry_failed and (r.method == "none" or r.fetch_failed):
                 retryable_urls.append(r.input_url)
             recent.appendleft(row)
@@ -237,11 +242,12 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 retry_done += 1
                 if r.emails:
                     emails_found += 1
+                latest_category_by_url[r.input_url] = es.classify_domain_result(r)
                 recent.appendleft(row)
                 status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
                 status_text.text(f"[retry {retry_done}/{retry_total}] {r.domain or r.input_url}: {status}")
                 table_placeholder.dataframe(pd.DataFrame(list(recent)), width='stretch')
-    return done
+    return done, latest_category_by_url
 
 
 if run_clicked:
@@ -307,7 +313,7 @@ if run_clicked:
         table_placeholder = st.empty()
 
         start_time = time.time()
-        done = asyncio.run(_run_batch_live(
+        done, latest_category_by_url = asyncio.run(_run_batch_live(
             remaining, workers, delay, proxies, verify_mx, use_playwright, respect_robots,
             csv_path, write_header, prior_done, total_all,
             progress_bar, status_text, timer_text, table_placeholder, start_time,
@@ -320,6 +326,25 @@ if run_clicked:
         st.success(f"Done — {done} domain(s) processed this run in {total_elapsed:.1f}s "
                    f"({per:.1f}s/domain average). "
                    f"{prior_done + done}/{total_all} saved in total.")
+
+        if latest_category_by_url:
+            batch_summary = es.summarize_batch(latest_category_by_url)
+            es.log_batch_summary(batch_summary, BATCH_HISTORY_PATH)
+            st.session_state.last_batch_summary = batch_summary
+
+if st.session_state.get("last_batch_summary"):
+    summary = st.session_state.last_batch_summary
+    st.subheader("📊 Batch summary")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("With email", summary["email_found"])
+    col2.metric("Salvage only", summary["salvage_only"])
+    col3.metric("Genuinely no result", summary["genuine_no_result"])
+    col4.metric("Connection failed", summary["connection_failed"])
+
+    history = es.load_batch_history(BATCH_HISTORY_PATH)
+    if len(history) > 1:
+        with st.expander(f"📈 History ({len(history)} recent batch(es))"):
+            st.dataframe(pd.DataFrame(history), width='stretch', hide_index=True)
 
 # Results are read back from the on-disk job CSV (the source of truth),
 # not from memory — so they're complete even though the live run only held

@@ -11,6 +11,8 @@ Run with either:
 """
 
 import asyncio
+import os
+import tempfile
 import unittest
 import unittest.mock
 from urllib import robotparser
@@ -193,6 +195,22 @@ class TestRankContactUrls(unittest.TestCase):
         hard = ["https://x.com/company/global/contact-us"]
         self.assertEqual(es.rank_contact_urls(hard, "https://x.com"), hard)
 
+    def test_hard_match_outranks_soft_sub_token_pileup(self):
+        # Regression: a page whose slug happens to contain several
+        # contact-adjacent words as sub-tokens of a compound segment (here:
+        # "about", "about-us", "contact", "support" — 4 soft hits) used to
+        # outscore a real, dedicated /contact page (1 hard hit), crowding it
+        # out of the top-N candidates. Same root pattern as the zendesk
+        # contact-center bug (sub-tokens of an irrelevant compound phrase
+        # treated as independent evidence), different mechanism: that fix
+        # only closed the depth-bypass loophole, not the scoring itself.
+        urls = [
+            "https://x.com/about-us/contact-support-team",
+            "https://x.com/contact",
+        ]
+        picked = es.rank_contact_urls(urls, "https://x.com")
+        self.assertEqual(picked[0], "https://x.com/contact")
+
 
 class TestEmailMatchesDomain(unittest.TestCase):
     def test_exact_and_subdomain(self):
@@ -258,6 +276,18 @@ class TestRoleClassification(unittest.TestCase):
         ranked = es.rank_emails_by_role(emails)
         self.assertEqual(ranked[0], "info@x.com")   # general wins
         self.assertEqual(ranked[-1], "legal@x.com")  # legal last
+
+    def test_transactional_addresses_not_misclassified_as_personal(self):
+        # Regression: these single alpha-only tokens fell through
+        # classify_email_role's "not a known keyword, so assume it's a
+        # person's first name" heuristic before SYSTEM_LOCALPARTS covered
+        # them — meaning a scraped unsubscribe@/confirm@-style address
+        # (priority 3, "personal") could outrank a genuine press/careers/
+        # billing/legal contact (priority 4-7) and become primary_email.
+        for local in ["unsubscribe", "confirm", "verify", "activate",
+                      "signup", "register", "optout", "subscribe"]:
+            with self.subTest(local=local):
+                self.assertEqual(es.classify_email_role(f"{local}@x.com"), "other")
 
     def test_pick_primary_prefers_own_domain(self):
         own = ["support@x.com"]
@@ -430,14 +460,19 @@ class TestFetchAndExtractPagesDistinguishesFailureFromEmpty(unittest.IsolatedAsy
 
         robots = es.RobotsPolicy(None, [], enabled=False)
         with unittest.mock.patch.object(es, "fetch", fake_fetch_none):
-            emails, source_pages, fetched_ok, fetch_failed = await es.fetch_and_extract_pages(
-                None, ["https://x.com/contact", "https://x.com/about"], robots, delay=0
+            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social = (
+                await es.fetch_and_extract_pages(
+                    None, ["https://x.com/contact", "https://x.com/about"], robots, delay=0
+                )
             )
 
         self.assertEqual(emails, set())
         self.assertEqual(source_pages, set())
         self.assertEqual(fetched_ok, 0)
         self.assertEqual(fetch_failed, 2)
+        self.assertEqual(phones, set())
+        self.assertEqual(whatsapp, set())
+        self.assertEqual(social, set())
 
     async def test_fetches_succeed_but_page_has_no_email(self):
         class FakeResp:
@@ -448,14 +483,17 @@ class TestFetchAndExtractPagesDistinguishesFailureFromEmpty(unittest.IsolatedAsy
 
         robots = es.RobotsPolicy(None, [], enabled=False)
         with unittest.mock.patch.object(es, "fetch", fake_fetch_ok):
-            emails, source_pages, fetched_ok, fetch_failed = await es.fetch_and_extract_pages(
-                None, ["https://x.com/contact"], robots, delay=0
+            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social = (
+                await es.fetch_and_extract_pages(
+                    None, ["https://x.com/contact"], robots, delay=0
+                )
             )
 
         self.assertEqual(emails, set())
         self.assertEqual(source_pages, set())
         self.assertEqual(fetched_ok, 1)
         self.assertEqual(fetch_failed, 0)
+        self.assertEqual(phones, set())
 
     async def test_mixed_some_fetch_some_dont(self):
         class FakeResp:
@@ -468,8 +506,10 @@ class TestFetchAndExtractPagesDistinguishesFailureFromEmpty(unittest.IsolatedAsy
 
         robots = es.RobotsPolicy(None, [], enabled=False)
         with unittest.mock.patch.object(es, "fetch", fake_fetch_mixed):
-            emails, source_pages, fetched_ok, fetch_failed = await es.fetch_and_extract_pages(
-                None, ["https://x.com/works", "https://x.com/broken"], robots, delay=0
+            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social = (
+                await es.fetch_and_extract_pages(
+                    None, ["https://x.com/works", "https://x.com/broken"], robots, delay=0
+                )
             )
 
         self.assertEqual(emails, {"hello@company-x.com"})
@@ -502,6 +542,185 @@ class TestResolverSelection(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.patch.object(es, "AsyncResolver", side_effect=RuntimeError("no aiodns")):
             resolver = es._new_resolver()
         self.assertIsInstance(resolver, es.ThreadedResolver)
+
+
+class TestSalvageExtraction(unittest.TestCase):
+    """Phone/WhatsApp/social salvage — used only when a domain ends up with
+    no email but its pages fetched fine. Each extractor is deliberately
+    conservative (tel: hrefs and a leading "+" required for phone; the two
+    literal WhatsApp link shapes; known social-platform URL patterns with
+    share/intent noise excluded) to avoid false positives, the same
+    "trust a hard signal over a loose regex" discipline used for email
+    extraction elsewhere in this module."""
+
+    def test_phone_tel_href(self):
+        html = '<a href="tel:+923001234567">Call us</a>'
+        self.assertIn("+923001234567", es.extract_phone_numbers_from_html(html))
+
+    def test_phone_standard_text_format(self):
+        html = "<p>Reach us at +1 (555) 123-4567 anytime.</p>"
+        self.assertIn("+1 (555) 123-4567", es.extract_phone_numbers_from_html(html))
+
+    def test_phone_does_not_false_positive_on_dates_prices_codes(self):
+        html = "<p>Published 2024-06-15, price $123.45, order #98765432.</p>"
+        self.assertEqual(es.extract_phone_numbers_from_html(html), set())
+
+    def test_whatsapp_wa_me_link(self):
+        html = '<a href="https://wa.me/447577305736">Chat on WhatsApp</a>'
+        self.assertIn("https://wa.me/447577305736", es.extract_whatsapp_links_from_html(html))
+
+    def test_whatsapp_send_link(self):
+        html = '<a href="https://api.whatsapp.com/send?phone=447577305736&text=hi">WhatsApp</a>'
+        found = es.extract_whatsapp_links_from_html(html)
+        self.assertTrue(any("whatsapp.com/send" in u for u in found))
+
+    def test_social_profile_link(self):
+        html = '<footer><a href="https://www.instagram.com/mybrand/">Instagram</a></footer>'
+        self.assertIn("https://www.instagram.com/mybrand/", es.extract_social_links_from_html(html))
+
+    def test_social_excludes_share_widget_noise(self):
+        # Regression guard: a "Share on Facebook" button's sharer.php URL is
+        # not the business's own profile — must not be mistaken for one.
+        html = '<a href="https://www.facebook.com/sharer.php?u=https://x.com/post">Share</a>'
+        self.assertEqual(es.extract_social_links_from_html(html), set())
+
+    def test_page_with_none_of_the_above_returns_empty(self):
+        html = "<html><body><h1>Welcome</h1><p>We sell widgets.</p></body></html>"
+        self.assertEqual(es.extract_phone_numbers_from_html(html), set())
+        self.assertEqual(es.extract_whatsapp_links_from_html(html), set())
+        self.assertEqual(es.extract_social_links_from_html(html), set())
+
+
+class TestMaybeApplySalvage(unittest.TestCase):
+    """The gating logic: salvage should only ever surface for a domain that
+    genuinely ended up with no email despite its pages fetching
+    successfully — never when an email was found, never when every page
+    failed to fetch (nothing real to salvage from in that case)."""
+
+    def test_applies_when_no_email_and_fetch_succeeded(self):
+        result = es.DomainResult(input_url="https://x.com")
+        result.fetch_failed = False
+        phones, whatsapp, social = {"+1234"}, {"https://wa.me/1234"}, {"https://instagram.com/x"}
+        es._maybe_apply_salvage(result, phones, whatsapp, social)
+        self.assertEqual(result.phones, phones)
+        self.assertEqual(result.whatsapp_links, whatsapp)
+        self.assertEqual(result.social_links, social)
+
+    def test_does_not_apply_when_email_was_found(self):
+        result = es.DomainResult(input_url="https://x.com")
+        result.emails = {"hello@x.com"}
+        result.fetch_failed = False
+        es._maybe_apply_salvage(result, {"+1234"}, set(), set())
+        self.assertEqual(result.phones, set())
+
+    def test_does_not_apply_when_fetch_failed(self):
+        # Every candidate page failed to fetch — there's no real page
+        # content to have salvaged anything from in the first place.
+        result = es.DomainResult(input_url="https://x.com")
+        result.fetch_failed = True
+        es._maybe_apply_salvage(result, {"+1234"}, set(), set())
+        self.assertEqual(result.phones, set())
+
+
+class TestClassifyDomainResult(unittest.TestCase):
+    """The four hit-rate buckets must be mutually exclusive and cover every
+    real outcome a domain can land in."""
+
+    def test_email_found(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.emails = {"hello@x.com"}
+        self.assertEqual(es.classify_domain_result(r), "email_found")
+
+    def test_connection_failed_method_none(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "none"
+        self.assertEqual(es.classify_domain_result(r), "connection_failed")
+
+    def test_connection_failed_fetch_failed_flag(self):
+        # method is "sitemap" (candidates were found) but every one of them
+        # failed to fetch — still a connection failure, not a genuine result.
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        r.fetch_failed = True
+        self.assertEqual(es.classify_domain_result(r), "connection_failed")
+
+    def test_salvage_only(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        r.phones = {"+1234567890"}
+        self.assertEqual(es.classify_domain_result(r), "salvage_only")
+
+    def test_genuine_no_result(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        self.assertEqual(es.classify_domain_result(r), "genuine_no_result")
+
+
+class TestSummarizeBatch(unittest.TestCase):
+    def test_counts_each_bucket(self):
+        latest_category_by_url = {
+            "a.com": "email_found",
+            "b.com": "email_found",
+            "c.com": "connection_failed",
+            "d.com": "salvage_only",
+            "e.com": "genuine_no_result",
+        }
+        summary = es.summarize_batch(latest_category_by_url)
+        self.assertEqual(summary["total"], 5)
+        self.assertEqual(summary["email_found"], 2)
+        self.assertEqual(summary["connection_failed"], 1)
+        self.assertEqual(summary["salvage_only"], 1)
+        self.assertEqual(summary["genuine_no_result"], 1)
+
+    def test_empty_batch(self):
+        summary = es.summarize_batch({})
+        self.assertEqual(summary["total"], 0)
+        self.assertEqual(summary["email_found"], 0)
+
+
+class TestBatchHistoryLog(unittest.TestCase):
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.remove(self.path)  # start from a genuinely non-existent file
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_log_then_load_round_trip(self):
+        summary1 = {"total": 10, "email_found": 4, "connection_failed": 3,
+                    "salvage_only": 2, "genuine_no_result": 1}
+        summary2 = {"total": 5, "email_found": 5, "connection_failed": 0,
+                    "salvage_only": 0, "genuine_no_result": 0}
+        es.log_batch_summary(summary1, self.path)
+        es.log_batch_summary(summary2, self.path)
+
+        history = es.load_batch_history(self.path)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["total"], 10)
+        self.assertEqual(history[1]["total"], 5)
+        self.assertIn("timestamp", history[0])
+
+    def test_load_missing_file_returns_empty(self):
+        self.assertEqual(es.load_batch_history(self.path), [])
+
+    def test_load_respects_limit(self):
+        for i in range(5):
+            es.log_batch_summary({"total": i, "email_found": 0, "connection_failed": 0,
+                                   "salvage_only": 0, "genuine_no_result": 0}, self.path)
+        history = es.load_batch_history(self.path, limit=2)
+        self.assertEqual(len(history), 2)
+        # Most recent last.
+        self.assertEqual(history[-1]["total"], 4)
+
+    def test_load_skips_corrupt_lines(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("not valid json\n")
+            f.write('{"total": 1, "email_found": 1}\n')
+        history = es.load_batch_history(self.path)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["total"], 1)
 
 
 if __name__ == "__main__":

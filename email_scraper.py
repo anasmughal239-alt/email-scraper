@@ -33,6 +33,7 @@ import concurrent.futures
 import csv
 import email.utils
 import gzip
+import json
 import os
 import random
 import re
@@ -340,6 +341,18 @@ SYSTEM_LOCALPARTS = {
     "webmaster", "postmaster", "hostmaster", "newsletter", "newsletters",
     "notifications", "notification", "mailer", "daemon", "bounce", "bounces",
     "root", "administrator", "automated", "system", "do-not-reply",
+    # Transactional/automated addresses that are single alpha-only tokens —
+    # without this, classify_email_role's fallback heuristic (a lone
+    # alpha token not in this set is assumed to be a person's first name)
+    # misclassifies these as "personal", which outranks press/careers/
+    # billing/legal in ROLE_PRIORITY. Confirmed via direct test: unsubscribe@,
+    # confirm@, verify@, activate@, signup@, register@, optout@, and
+    # subscribe@ all classified as "personal" before this fix — any of
+    # these scraped from a footer newsletter widget could have become the
+    # CSV's primary_email.
+    "unsubscribe", "confirm", "verify", "verification", "activate",
+    "activation", "signup", "register", "registration", "optout",
+    "subscribe", "confirmation",
 }
 
 
@@ -401,6 +414,14 @@ class DomainResult:
     # (built specifically to retry connection-class failures) silently
     # skipped exactly this case, since it only ever checked method=="none".
     fetch_failed: bool = False
+    # Salvage bucket: phone/WhatsApp/social signals from the same pages
+    # already fetched, populated only when a domain ends up with no email
+    # AND those pages fetched successfully (fetch_failed is False) — a
+    # domain that has a phone/social but no email should be distinguishable
+    # from one with genuinely nothing, not silently blank either way.
+    phones: set = field(default_factory=set)
+    whatsapp_links: set = field(default_factory=set)
+    social_links: set = field(default_factory=set)
 
 
 # --------------------------------------------------------------------------
@@ -894,7 +915,28 @@ def rank_contact_urls(urls: list, base_url: str, limit: int = MAX_PAGES_PER_DOMA
 
         # Prefer shallow, dedicated pages (e.g. /contact) over deep ones.
         depth_bonus = max(0, 3 - len(segments)) * 0.5
-        scored.append((len(matched) + depth_bonus, url))
+
+        # A genuine hard match on a WHOLE segment (a dedicated page like
+        # /contact or /contact-us) is a fundamentally stronger signal than
+        # any number of soft sub-token matches scattered across a longer
+        # compound segment — those are coincidental keyword overlap, not
+        # evidence of a dedicated contact page. Without this, a page whose
+        # slug happens to contain several contact-adjacent words (e.g.
+        # /about-us/contact-support-team: matches "about", "about-us",
+        # "contact", "support" — 4 soft hits) could out-score a real
+        # /contact page (1 hard hit) purely by accumulating more matched
+        # keywords, crowding it out of the top-N candidates that actually
+        # get fetched. Same root pattern as the zendesk contact-center bug
+        # (sub-tokens of an irrelevant compound phrase treated as
+        # independent evidence), different mechanism: that fix only closed
+        # the depth-bypass loophole, not the scoring itself. Verified via
+        # direct test before this fix: the compound-slug example above
+        # scored 4.5 against /contact's 2.0 and ranked first.
+        if hard_segment_matches:
+            score = 100 + depth_bonus
+        else:
+            score = len(matched) + depth_bonus
+        scored.append((score, url))
 
     scored.sort(key=lambda t: -t[0])
     return [u for _, u in scored[:limit]]
@@ -1048,6 +1090,91 @@ def extract_emails_from_html(html: str) -> set:
 
 
 # --------------------------------------------------------------------------
+# Salvage extraction: phone/WhatsApp/social, used only when a domain ends up
+# with no email despite pages fetching successfully. Reuses HTML already
+# fetched during the same run — no new requests are issued for this.
+# --------------------------------------------------------------------------
+
+TEL_HREF_RE = re.compile(r'href=["\']tel:([^"\']+)["\']', re.IGNORECASE)
+# Requires a leading "+" (international format) rather than matching bare
+# digit runs. This trades recall (misses plain local numbers with no country
+# code) for precision — a phone regex without that anchor is a false-positive
+# magnet against dates, prices, product/order codes, and version numbers.
+# Same "trust the hard signal (tel:), stay conservative on the text regex"
+# discipline already used for email extraction.
+PHONE_INTL_TEXT_RE = re.compile(
+    r'(?<![\w/.])\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?(?:[\s.\-]?\d{2,4}){2,4}(?![\d])'
+)
+
+# wa.me/<number> and whatsapp.com/send?phone=<number> are the only two link
+# shapes WhatsApp itself generates for a "click to chat" link — both are
+# explicit, unambiguous signals, no regex-guessing needed.
+WHATSAPP_RE = re.compile(
+    r'https?://(?:api\.|web\.)?(?:wa\.me/[\d+]+|whatsapp\.com/send\?[^\s"\'<>]*)',
+    re.IGNORECASE,
+)
+
+# Share/intent/tracking-pixel URL shapes that look like a social link but
+# aren't the business's own profile — e.g. every page with a "Share on
+# Facebook" button contains a facebook.com/sharer.php URL that has nothing
+# to do with the business being scraped.
+_SOCIAL_SHARE_NOISE_RE = re.compile(
+    r'(?:sharer|share\.php|intent/tweet|/tr\?|dialog/share|share_button)',
+    re.IGNORECASE,
+)
+_SOCIAL_PLATFORM_PATTERNS = (
+    re.compile(r'https?://(?:www\.)?facebook\.com/[A-Za-z0-9_.\-]+/?(?:\?[^"\'<>\s]*)?$', re.IGNORECASE),
+    re.compile(r'https?://(?:www\.)?instagram\.com/[A-Za-z0-9_.\-]+/?(?:\?[^"\'<>\s]*)?$', re.IGNORECASE),
+    re.compile(r'https?://(?:www\.)?linkedin\.com/(?:company|in)/[A-Za-z0-9_.\-]+/?(?:\?[^"\'<>\s]*)?$', re.IGNORECASE),
+    re.compile(r'https?://(?:www\.)?(?:twitter|x)\.com/[A-Za-z0-9_]+/?(?:\?[^"\'<>\s]*)?$', re.IGNORECASE),
+)
+
+
+def extract_phone_numbers_from_html(html: str) -> set:
+    found = set()
+    for m in TEL_HREF_RE.finditer(html):
+        num = m.group(1).split("?")[0].strip()
+        if num:
+            found.add(num)
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    visible_text = soup.get_text(" ", strip=True)
+    for m in PHONE_INTL_TEXT_RE.finditer(visible_text):
+        found.add(m.group(0).strip())
+    return found
+
+
+def extract_whatsapp_links_from_html(html: str) -> set:
+    return {m.group(0) for m in WHATSAPP_RE.finditer(html)}
+
+
+def extract_social_links_from_html(html: str) -> set:
+    soup = BeautifulSoup(html, "html.parser")
+    found = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if _SOCIAL_SHARE_NOISE_RE.search(href):
+            continue
+        if any(pattern.match(href) for pattern in _SOCIAL_PLATFORM_PATTERNS):
+            found.add(href)
+    return found
+
+
+def _extract_all_from_html(html: str) -> dict:
+    """Single combined extraction pass over one page's HTML, run once per
+    fetched page instead of four separate executor round-trips for the
+    same content."""
+    return {
+        "emails": extract_emails_from_html(html),
+        "phones": extract_phone_numbers_from_html(html),
+        "whatsapp": extract_whatsapp_links_from_html(html),
+        "social": extract_social_links_from_html(html),
+    }
+
+
+# --------------------------------------------------------------------------
 # Optional: MX record sanity check (soft dependency on dnspython)
 # --------------------------------------------------------------------------
 
@@ -1146,13 +1273,19 @@ class PlaywrightFetcher:
             await self._pw.stop()
 
 
-async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: list, delay: float) -> None:
+async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: list, delay: float,
+                               salvage_phones: set, salvage_whatsapp: set, salvage_social: set) -> None:
     """Re-fetches pages with a real headless browser when the static pass
     found nothing, to catch footers/contact info rendered by client-side JS.
     Only MAX_CONCURRENT_PLAYWRIGHT_INSTANCES domains can be running a
     Chromium instance at any moment — other domains needing the fallback
     wait here until a slot frees up, trading some wall-clock time for a
-    bounded memory ceiling regardless of --workers."""
+    bounded memory ceiling regardless of --workers.
+
+    salvage_phones/salvage_whatsapp/salvage_social are mutated in place
+    (merged via |=) with anything found on JS-rendered pages, so the
+    caller's salvage data reflects Playwright's fetches too, not just the
+    static pass's."""
     async with _playwright_semaphore:
         try:
             fetched_any = False
@@ -1170,10 +1303,13 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
                         # Homepage was previously unreachable/empty; now that we
                         # have JS-rendered HTML, look for contact links in it too.
                         extra_links = await _run_cpu(find_contact_links_on_page, html, base_url)
-                    found = await _run_cpu(extract_emails_from_html, html)
-                    if found:
-                        result.emails |= found
+                    extracted = await _run_cpu(_extract_all_from_html, html)
+                    if extracted["emails"]:
+                        result.emails |= extracted["emails"]
                         result.source_pages.add(page_url)
+                    salvage_phones |= extracted["phones"]
+                    salvage_whatsapp |= extracted["whatsapp"]
+                    salvage_social |= extracted["social"]
 
                 for link_url in extra_links[:MAX_PAGES_PER_DOMAIN - 1]:
                     html = await pf.fetch(link_url)
@@ -1181,10 +1317,13 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
                     if not html:
                         continue
                     fetched_any = True
-                    found = await _run_cpu(extract_emails_from_html, html)
-                    if found:
-                        result.emails |= found
+                    extracted = await _run_cpu(_extract_all_from_html, html)
+                    if extracted["emails"]:
+                        result.emails |= extracted["emails"]
                         result.source_pages.add(link_url)
+                    salvage_phones |= extracted["phones"]
+                    salvage_whatsapp |= extracted["whatsapp"]
+                    salvage_social |= extracted["social"]
 
             if result.emails:
                 result.method = f"{result.method}+playwright"
@@ -1219,17 +1358,25 @@ async def fetch_and_extract_pages(session: aiohttp.ClientSession, urls: list, ro
     *starts* rather than serializing them — a soft rate limit that still
     lets slow pages run in the background instead of blocking faster ones.
 
-    Returns (emails, source_pages, fetched_ok_count, fetch_failed_count).
-    The last two exist specifically so the caller can tell "every candidate
-    page failed to fetch" (403/timeout/connection reset/exhausted retries)
-    apart from "pages fetched fine and genuinely had no email" — before this,
-    both looked identical (empty emails, empty source_pages), which silently
-    broke --retry-failed for exactly the case it was built to catch."""
+    Returns (emails, source_pages, fetched_ok_count, fetch_failed_count,
+    phones, whatsapp_links, social_links). fetched_ok_count/fetch_failed_count
+    exist specifically so the caller can tell "every candidate page failed to
+    fetch" (403/timeout/connection reset/exhausted retries) apart from "pages
+    fetched fine and genuinely had no email" — before this, both looked
+    identical (empty emails, empty source_pages), which silently broke
+    --retry-failed for exactly the case it was built to catch. The salvage
+    sets (phones/whatsapp_links/social_links) are extracted from the same
+    fetched HTML regardless of whether emails were found — no extra
+    requests — and it's up to the caller whether to expose them (only meant
+    for domains that end up with no email)."""
     emails: set = set()
     source_pages: set = set()
+    phones: set = set()
+    whatsapp_links: set = set()
+    social_links: set = set()
     allowed_urls = [u for u in urls if robots.can_fetch(u)]
     if not allowed_urls:
-        return emails, source_pages, 0, 0
+        return emails, source_pages, 0, 0, phones, whatsapp_links, social_links
 
     sem = asyncio.Semaphore(min(PER_DOMAIN_FETCH_WORKERS, len(allowed_urls)))
 
@@ -1238,7 +1385,7 @@ async def fetch_and_extract_pages(session: aiohttp.ClientSession, urls: list, ro
             resp = await fetch(session, url, proxy=proxy)
         if resp is None:
             return url, None
-        return url, await _run_cpu(extract_emails_from_html, resp.text)
+        return url, await _run_cpu(_extract_all_from_html, resp.text)
 
     tasks = []
     for url in allowed_urls:
@@ -1255,15 +1402,18 @@ async def fetch_and_extract_pages(session: aiohttp.ClientSession, urls: list, ro
     results = await asyncio.gather(*tasks)
     fetched_ok = 0
     fetch_failed = 0
-    for url, found in results:
-        if found is None:
+    for url, extracted in results:
+        if extracted is None:
             fetch_failed += 1
             continue
         fetched_ok += 1
-        if found:
-            emails |= found
+        if extracted["emails"]:
+            emails |= extracted["emails"]
             source_pages.add(url)
-    return emails, source_pages, fetched_ok, fetch_failed
+        phones |= extracted["phones"]
+        whatsapp_links |= extracted["whatsapp"]
+        social_links |= extracted["social"]
+    return emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp_links, social_links
 
 
 def _decide_empty_result_status(pages_fetched_ok: int, pages_fetch_failed: int) -> tuple:
@@ -1284,6 +1434,18 @@ def _decide_empty_result_status(pages_fetched_ok: int, pages_fetch_failed: int) 
     return False, "no emails found on checked pages"
 
 
+def _maybe_apply_salvage(result: "DomainResult", phones: set, whatsapp_links: set, social_links: set) -> None:
+    """Exposes salvaged phone/WhatsApp/social data only when the domain
+    genuinely ended up with no email despite its pages fetching
+    successfully (fetch_failed is False) — a domain where every page failed
+    to fetch has no real signal to salvage from, and a domain where an
+    email WAS found doesn't need the fallback."""
+    if not result.emails and not result.fetch_failed:
+        result.phones = phones
+        result.whatsapp_links = whatsapp_links
+        result.social_links = social_links
+
+
 async def process_domain(raw_url: str, delay: float, proxies: Optional[list], verify_mx: bool,
                           use_playwright: bool = False, respect_robots: bool = True) -> DomainResult:
     result = DomainResult(input_url=raw_url)
@@ -1301,7 +1463,9 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
         result.method = "none"
         result.error = "domain unreachable (fast-fail connectivity probe)"
         if use_playwright:
-            await playwright_fallback(result, base_url, [], delay)
+            phones, whatsapp_links, social_links = set(), set(), set()
+            await playwright_fallback(result, base_url, [], delay, phones, whatsapp_links, social_links)
+            _maybe_apply_salvage(result, phones, whatsapp_links, social_links)
         return result
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
@@ -1334,11 +1498,16 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                 result.method = "none"
                 result.error = "no sitemap, no contact links, homepage unreachable"
                 if use_playwright:
-                    await playwright_fallback(result, base_url, pages_to_check, delay)
+                    phones, whatsapp_links, social_links = set(), set(), set()
+                    await playwright_fallback(result, base_url, pages_to_check, delay,
+                                               phones, whatsapp_links, social_links)
+                    _maybe_apply_salvage(result, phones, whatsapp_links, social_links)
                 return result
 
-            emails, source_pages, fetched_ok, fetch_failed_count = await fetch_and_extract_pages(
-                session, pages_to_check[:MAX_PAGES_PER_DOMAIN], robots, delay, proxy
+            emails, source_pages, fetched_ok, fetch_failed_count, phones, whatsapp_links, social_links = (
+                await fetch_and_extract_pages(
+                    session, pages_to_check[:MAX_PAGES_PER_DOMAIN], robots, delay, proxy
+                )
             )
             result.emails |= emails
             result.source_pages |= source_pages
@@ -1352,13 +1521,17 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                 second_hop_urls = await _run_cpu(
                     find_second_hop_links, home_resp.text, base_url, set(pages_to_check)
                 )
-                emails, source_pages, fetched_ok, fetch_failed_count = await fetch_and_extract_pages(
+                (emails, source_pages, fetched_ok, fetch_failed_count,
+                 hop_phones, hop_whatsapp, hop_social) = await fetch_and_extract_pages(
                     session, second_hop_urls, robots, delay, proxy
                 )
                 result.emails |= emails
                 result.source_pages |= source_pages
                 total_fetched_ok += fetched_ok
                 total_fetch_failed += fetch_failed_count
+                phones |= hop_phones
+                whatsapp_links |= hop_whatsapp
+                social_links |= hop_social
 
             # Decide (before Playwright, so Playwright can override it below if
             # it manages to fetch real content the static pass couldn't) whether
@@ -1370,7 +1543,8 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                 )
 
             if not result.emails and use_playwright:
-                await playwright_fallback(result, base_url, pages_to_check, delay)
+                await playwright_fallback(result, base_url, pages_to_check, delay,
+                                           phones, whatsapp_links, social_links)
 
             if verify_mx and result.emails:
                 emails_list = list(result.emails)
@@ -1379,6 +1553,7 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
 
             if not result.emails:
                 result.error = result.error or "no emails found on checked pages"
+            _maybe_apply_salvage(result, phones, whatsapp_links, social_links)
 
         except Exception as exc:  # noqa: BLE001 - keep batch running on a single-domain failure
             result.error = f"unexpected error: {exc}"
@@ -1425,6 +1600,7 @@ def _load_completed_input_urls(output_path: str) -> set:
 CSV_FIELDNAMES = [
     "input_url", "domain", "primary_email", "primary_role",
     "own_domain_emails", "other_domain_emails",
+    "phone", "whatsapp", "social_links",
     "method", "source_pages", "error",
 ]
 
@@ -1446,10 +1622,78 @@ def result_to_row(r: "DomainResult") -> dict:
         "primary_role": primary_role,
         "own_domain_emails": "; ".join(own_ranked),
         "other_domain_emails": "; ".join(other_ranked),
+        "phone": "; ".join(sorted(r.phones)),
+        "whatsapp": "; ".join(sorted(r.whatsapp_links)),
+        "social_links": "; ".join(sorted(r.social_links)),
         "method": r.method,
         "source_pages": "; ".join(sorted(r.source_pages)),
         "error": r.error,
     }
+
+
+# --------------------------------------------------------------------------
+# Per-batch hit-rate tracking
+# --------------------------------------------------------------------------
+
+DEFAULT_BATCH_HISTORY_LOG = "batch_history.jsonl"
+
+
+def classify_domain_result(r: "DomainResult") -> str:
+    """Categorizes a single result into one of four mutually exclusive
+    hit-rate buckets: email_found, connection_failed (method=="none"/""
+    or fetch_failed — no real page content was ever retrieved),
+    salvage_only (no email, but pages fetched fine and phone/WhatsApp/
+    social was recovered), or genuine_no_result (pages fetched fine,
+    genuinely nothing at all). Every DomainResult falls into exactly one
+    bucket."""
+    if r.emails:
+        return "email_found"
+    if r.method in ("", "none") or r.fetch_failed:
+        return "connection_failed"
+    if r.phones or r.whatsapp_links or r.social_links:
+        return "salvage_only"
+    return "genuine_no_result"
+
+
+def summarize_batch(latest_category_by_url: dict) -> dict:
+    """Turns a {input_url: category} mapping (the *final* category per
+    domain — a retried domain's earlier category is overwritten) into the
+    aggregate counts for one batch."""
+    counts = {"email_found": 0, "connection_failed": 0, "salvage_only": 0, "genuine_no_result": 0}
+    for category in latest_category_by_url.values():
+        counts[category] += 1
+    return {"total": len(latest_category_by_url), **counts}
+
+
+def log_batch_summary(summary: dict, log_path: str = DEFAULT_BATCH_HISTORY_LOG) -> dict:
+    """Appends one JSON line per batch (not per domain) to a small
+    persistent log, so hit-rate trends are visible over time instead of
+    relying on memory or one-off spot checks. JSONL (not a single JSON
+    array) so appending never requires reading/rewriting the whole file."""
+    record = {"timestamp": datetime.now(timezone.utc).isoformat(), **summary}
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    return record
+
+
+def load_batch_history(log_path: str = DEFAULT_BATCH_HISTORY_LOG, limit: int = 20) -> list:
+    """Reads back the most recent batch summaries, most recent last (so a
+    caller can display them in chronological order). Missing/corrupt lines
+    are skipped rather than failing the whole read — a log used purely for
+    visibility shouldn't be able to break anything by being malformed."""
+    if not os.path.exists(log_path):
+        return []
+    records = []
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records[-limit:]
 
 
 async def _process_domain_with_hard_timeout(sem: asyncio.Semaphore, url: str, delay: float,
@@ -1536,7 +1780,8 @@ def _check_playwright_installed() -> None:
 async def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
                      proxies_path: Optional[str] = None, verify_mx: bool = False,
                      use_playwright: bool = False, respect_robots: bool = True,
-                     resume: bool = False, retry_failed: bool = False) -> None:
+                     resume: bool = False, retry_failed: bool = False,
+                     history_log_path: str = DEFAULT_BATCH_HISTORY_LOG) -> None:
     domains = load_domains(input_path)
     proxies = load_proxies(proxies_path)
 
@@ -1573,11 +1818,13 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
             f.flush()
 
         retryable_urls = []
+        latest_category_by_url: dict = {}
         async for done_count, total, r in process_domains_streaming(
             domains, max_workers, delay, proxies, verify_mx, use_playwright, respect_robots
         ):
             writer.writerow(result_to_row(r))
             f.flush()
+            latest_category_by_url[r.input_url] = classify_domain_result(r)
             if retry_failed and (r.method == "none" or r.fetch_failed):
                 retryable_urls.append(r.input_url)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
@@ -1605,10 +1852,20 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
             ):
                 writer.writerow(result_to_row(r))
                 f.flush()
+                latest_category_by_url[r.input_url] = classify_domain_result(r)
                 retry_count += 1
                 status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
                 print(f"[retry {retry_count}/{len(retryable_urls)}] {r.domain or r.input_url}: {status}",
                       flush=True)
+
+    summary = summarize_batch(latest_category_by_url)
+    log_batch_summary(summary, history_log_path)
+    print(f"Batch summary: {summary['total']} domain(s) — "
+          f"{summary['email_found']} with email, "
+          f"{summary['salvage_only']} salvage-only (phone/WhatsApp/social, no email), "
+          f"{summary['genuine_no_result']} genuinely no result, "
+          f"{summary['connection_failed']} connection failed. "
+          f"Logged to {history_log_path}.", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -1641,6 +1898,11 @@ def main():
                               "after a cooldown) domains that failed to connect at all — "
                               "catches transient network blips and temporary rate-limiting. "
                               "Does not retry domains that connected fine but had no email.")
+    parser.add_argument("--history-log", default=DEFAULT_BATCH_HISTORY_LOG,
+                         help="Path to the append-only JSONL file that a one-line hit-rate "
+                              f"summary gets appended to after every batch (default: "
+                              f"{DEFAULT_BATCH_HISTORY_LOG}), so trends are visible across "
+                              "runs over time.")
     args = parser.parse_args()
 
     asyncio.run(run_batch(
@@ -1654,6 +1916,7 @@ def main():
         respect_robots=not args.ignore_robots,
         resume=args.resume,
         retry_failed=args.retry_failed,
+        history_log_path=args.history_log,
     ))
 
 
