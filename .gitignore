@@ -1,9 +1,13 @@
 results.csv
+results_*.csv
 domains.txt
+domains_*.txt
 proxies.txt
 retry_list.txt
 batch_history.jsonl
+batch_history_*.jsonl
 runs/
 __pycache__/
 *.pyc
 .venv/
+_*_test.py

@@ -11,8 +11,10 @@ Run with either:
 """
 
 import asyncio
+import csv
 import os
 import tempfile
+import time
 import unittest
 import unittest.mock
 from urllib import robotparser
@@ -64,6 +66,54 @@ class TestEmailExtraction(unittest.TestCase):
         emails = es.extract_emails_from_html(html)
         self.assertIn("plus@company-x.com", emails)
         self.assertNotIn("u003eplus@company-x.com", emails)
+
+
+class TestJsonHydrationExtraction(unittest.TestCase):
+    """Real contact emails embedded in a framework's page-data JSON blob
+    (Next.js __NEXT_DATA__, JSON-LD, etc.) rather than rendered into visible
+    HTML — parsed as real JSON, not regexed as raw text, so it can't
+    reintroduce the escaped-fragment leak the plain script-stripping guards
+    against (see test_script_json_leak_stripped above)."""
+
+    def test_extracts_email_from_next_data_script(self):
+        html = (
+            '<script id="__NEXT_DATA__" type="application/json">'
+            '{"props": {"pageProps": {"contactEmail": "hi@nextsite.com"}}}'
+            "</script>"
+        )
+        self.assertIn("hi@nextsite.com", es.extract_emails_from_json_hydration(html))
+
+    def test_extracts_email_from_ld_json(self):
+        html = (
+            '<script type="application/ld+json">'
+            '{"@type": "Organization", "email": "contact@ldsite.com"}'
+            "</script>"
+        )
+        self.assertIn("contact@ldsite.com", es.extract_emails_from_json_hydration(html))
+
+    def test_nested_arrays_and_objects_are_walked(self):
+        html = (
+            '<script type="application/json">'
+            '{"a": [1, 2, {"b": {"c": ["deep@nested.com"]}}]}'
+            "</script>"
+        )
+        self.assertIn("deep@nested.com", es.extract_emails_from_json_hydration(html))
+
+    def test_malformed_json_does_not_crash(self):
+        html = '<script type="application/json">{not valid json</script>'
+        self.assertEqual(es.extract_emails_from_json_hydration(html), set())
+
+    def test_ordinary_script_without_json_type_or_id_is_ignored(self):
+        html = '<script>var x = "plain@js.com";</script>'
+        self.assertEqual(es.extract_emails_from_json_hydration(html), set())
+
+    def test_folded_into_extract_emails_from_html(self):
+        html = (
+            '<script id="__NEXT_DATA__" type="application/json">'
+            '{"email": "found@viahydration.com"}'
+            "</script>"
+        )
+        self.assertIn("found@viahydration.com", es.extract_emails_from_html(html))
 
 
 class TestCloudflareDecode(unittest.TestCase):
@@ -157,6 +207,16 @@ class TestObfuscatedExtraction(unittest.TestCase):
         got = es.extract_obfuscated_emails("Write to jane [at] example-corp [dot] org please")
         self.assertIn("jane@example-corp.org", got)
 
+    def test_two_part_cctld(self):
+        got = es.extract_obfuscated_emails("Email hello [at] example [dot] co [dot] uk for support")
+        self.assertIn("hello@example.co.uk", got)
+
+    def test_single_part_tld_still_works_without_trailing_group(self):
+        # Regression guard: adding the optional second-dot group must not
+        # break the plain single-TLD case it already handled.
+        got = es.extract_obfuscated_emails("Contact us at team [at] widgets [dot] io today")
+        self.assertIn("team@widgets.io", got)
+
 
 class TestRankContactUrls(unittest.TestCase):
     def test_contact_page_over_blog(self):
@@ -167,6 +227,18 @@ class TestRankContactUrls(unittest.TestCase):
         picked = es.rank_contact_urls(urls, "https://x.com")
         self.assertIn("https://x.com/contact", picked)
         self.assertNotIn("https://x.com/blog/how-to-contact-support", picked)
+
+    def test_contact_outranks_about_us_at_same_depth(self):
+        # Both are "hard" whole-segment matches at depth 1 — contact must
+        # still win reliably, not by sitemap-order coincidence.
+        urls = ["https://x.com/about-us", "https://x.com/contact"]
+        picked = es.rank_contact_urls(urls, "https://x.com")
+        self.assertEqual(picked[0], "https://x.com/contact")
+
+    def test_contact_outranks_about_us_regardless_of_input_order(self):
+        urls = ["https://x.com/contact", "https://x.com/about-us"]
+        picked = es.rank_contact_urls(urls, "https://x.com")
+        self.assertEqual(picked[0], "https://x.com/contact")
 
     def test_multi_language(self):
         urls = [
@@ -304,6 +376,26 @@ class TestRoleClassification(unittest.TestCase):
 
     def test_pick_primary_empty(self):
         self.assertEqual(es.pick_primary_email([], []), ("", ""))
+
+    def test_mailto_sourced_email_preferred_within_same_role(self):
+        # Both "general" role, tied by ROLE_PRIORITY — the mailto-sourced
+        # one should win the tiebreak over one that merely appeared in text.
+        emails = ["hello@x.com", "info@x.com"]
+        ranked = es.rank_emails_by_role(emails, mailto_emails={"info@x.com"})
+        self.assertEqual(ranked[0], "info@x.com")
+
+    def test_mailto_priority_does_not_override_role_priority(self):
+        # A mailto-sourced legal@ address must not outrank a plain-text
+        # info@ — role still wins first, mailto is only a same-role tiebreak.
+        emails = ["legal@x.com", "info@x.com"]
+        ranked = es.rank_emails_by_role(emails, mailto_emails={"legal@x.com"})
+        self.assertEqual(ranked[0], "info@x.com")
+
+    def test_pick_primary_prefers_mailto_source(self):
+        own = ["hello@x.com", "info@x.com"]
+        email, role = es.pick_primary_email(own, [], mailto_emails={"info@x.com"})
+        self.assertEqual(email, "info@x.com")
+        self.assertEqual(role, "general")
 
 
 class TestRobotsPolicy(unittest.TestCase):
@@ -455,12 +547,12 @@ class TestFetchAndExtractPagesDistinguishesFailureFromEmpty(unittest.IsolatedAsy
     failed outright, not just which pages happened to contain an email."""
 
     async def test_every_fetch_fails(self):
-        async def fake_fetch_none(session, url, proxy=None):
+        async def fake_fetch_none(session, url, proxy=None, blocked_sink=None):
             return None
 
         robots = es.RobotsPolicy(None, [], enabled=False)
         with unittest.mock.patch.object(es, "fetch", fake_fetch_none):
-            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social = (
+            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social, _blocked, _extras = (
                 await es.fetch_and_extract_pages(
                     None, ["https://x.com/contact", "https://x.com/about"], robots, delay=0
                 )
@@ -478,12 +570,12 @@ class TestFetchAndExtractPagesDistinguishesFailureFromEmpty(unittest.IsolatedAsy
         class FakeResp:
             text = "<html><body>Just some ordinary page content, no address here.</body></html>"
 
-        async def fake_fetch_ok(session, url, proxy=None):
+        async def fake_fetch_ok(session, url, proxy=None, blocked_sink=None):
             return FakeResp()
 
         robots = es.RobotsPolicy(None, [], enabled=False)
         with unittest.mock.patch.object(es, "fetch", fake_fetch_ok):
-            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social = (
+            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social, _blocked, _extras = (
                 await es.fetch_and_extract_pages(
                     None, ["https://x.com/contact"], robots, delay=0
                 )
@@ -499,14 +591,14 @@ class TestFetchAndExtractPagesDistinguishesFailureFromEmpty(unittest.IsolatedAsy
         class FakeResp:
             text = "<p>reach us at hello@company-x.com</p>"
 
-        async def fake_fetch_mixed(session, url, proxy=None):
+        async def fake_fetch_mixed(session, url, proxy=None, blocked_sink=None):
             if "works" in url:
                 return FakeResp()
             return None
 
         robots = es.RobotsPolicy(None, [], enabled=False)
         with unittest.mock.patch.object(es, "fetch", fake_fetch_mixed):
-            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social = (
+            emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp, social, _blocked, _extras = (
                 await es.fetch_and_extract_pages(
                     None, ["https://x.com/works", "https://x.com/broken"], robots, delay=0
                 )
@@ -655,6 +747,334 @@ class TestClassifyDomainResult(unittest.TestCase):
         r.method = "sitemap"
         self.assertEqual(es.classify_domain_result(r), "genuine_no_result")
 
+    def test_permanently_blocked(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "none"
+        r.blocked_by = "cloudflare"
+        self.assertEqual(es.classify_domain_result(r), "permanently_blocked")
+
+    def test_email_found_outranks_blocked_by(self):
+        # A partial block (some pages blocked, one candidate still yielded
+        # an email) is a real result — it shouldn't be demoted to
+        # permanently_blocked just because a signature was seen somewhere.
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        r.emails = {"hi@x.com"}
+        r.blocked_by = "akamai"
+        self.assertEqual(es.classify_domain_result(r), "email_found")
+
+    def test_has_contact_form(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        r.has_contact_form = True
+        self.assertEqual(es.classify_domain_result(r), "has_contact_form")
+
+    def test_salvage_only_outranks_has_contact_form(self):
+        # A phone/social number is a stronger signal than "there's a form
+        # somewhere" — salvage_only should win if both are present.
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        r.phones = {"+1234567890"}
+        r.has_contact_form = True
+        self.assertEqual(es.classify_domain_result(r), "salvage_only")
+
+
+class TestBlockedSignatureDetection(unittest.TestCase):
+    """Detection only — these tests confirm a known WAF/bot-challenge
+    block-page is correctly labeled, never that anything is bypassed."""
+
+    def test_detects_cloudflare_challenge_page(self):
+        html = (
+            "<html><head><title>Just a moment...</title></head><body>"
+            "<div class='cf-browser-verification'>Checking your browser...</div>"
+            "</body></html>"
+        )
+        self.assertEqual(es.detect_blocked_signature(html), "cloudflare")
+
+    def test_detects_akamai_block_page(self):
+        html = (
+            "<html><body><h1>Access Denied</h1>"
+            "<p>You don't have permission to access this resource.</p>"
+            "<p>Reference #18.7c5e1002.1690000000.1a2b3c4</p></body></html>"
+        )
+        self.assertEqual(es.detect_blocked_signature(html), "akamai")
+
+    def test_detects_perimeterx_block_page(self):
+        html = '<html><body><div id="px-captcha"></div>Please verify you are a human</body></html>'
+        self.assertEqual(es.detect_blocked_signature(html), "perimeterx")
+
+    def test_ordinary_page_not_flagged(self):
+        html = "<html><body><h1>Welcome to Acme Corp</h1><p>Contact us at hi@acme.com</p></body></html>"
+        self.assertEqual(es.detect_blocked_signature(html), "")
+
+    def test_generic_access_denied_alone_not_flagged(self):
+        # "access denied" alone is too generic (plenty of ordinary pages use
+        # the phrase) — only counts paired with Akamai's "reference #" marker.
+        html = "<html><body>Access Denied: you need to log in first.</body></html>"
+        self.assertEqual(es.detect_blocked_signature(html), "")
+
+    def test_empty_html_returns_empty(self):
+        self.assertEqual(es.detect_blocked_signature(""), "")
+
+
+class TestNoteBlockedSignature(unittest.IsolatedAsyncioTestCase):
+    class FakeResp:
+        def __init__(self, text, charset="utf-8"):
+            self._content = text.encode(charset)
+            self.charset = charset
+
+        async def read(self):
+            return self._content
+
+    async def test_appends_vendor_when_signature_present(self):
+        resp = self.FakeResp("<div class='cf-browser-verification'>blocked</div>")
+        sink: list = []
+        await es._note_blocked_signature(resp, sink)
+        self.assertEqual(sink, ["cloudflare"])
+
+    async def test_no_append_when_sink_is_none(self):
+        resp = self.FakeResp("<div class='cf-browser-verification'>blocked</div>")
+        await es._note_blocked_signature(resp, None)  # must not raise
+
+    async def test_no_append_when_no_signature(self):
+        resp = self.FakeResp("<h1>Ordinary page</h1>")
+        sink: list = []
+        await es._note_blocked_signature(resp, sink)
+        self.assertEqual(sink, [])
+
+
+class TestContactFormDetection(unittest.TestCase):
+    def test_detects_wpcf7_form(self):
+        html = '<form id="wpcf7-form-123" action="/contact"><input type="email" name="your-email"></form>'
+        self.assertTrue(es.detect_contact_form(html))
+
+    def test_detects_hubspot_form(self):
+        html = '<form class="hs-form stacked"><input type="email" name="email"></form>'
+        self.assertTrue(es.detect_contact_form(html))
+
+    def test_detects_generic_email_plus_message_shape(self):
+        html = (
+            '<form action="/submit">'
+            '<input type="email" name="from">'
+            '<textarea name="message"></textarea>'
+            '<button type="submit">Send</button>'
+            "</form>"
+        )
+        self.assertTrue(es.detect_contact_form(html))
+
+    def test_email_input_alone_not_flagged(self):
+        # A newsletter-signup form (email input, no message field) isn't a
+        # contact form — it's a different intent entirely.
+        html = '<form action="/subscribe"><input type="email" name="email"><button>Subscribe</button></form>'
+        self.assertFalse(es.detect_contact_form(html))
+
+    def test_page_with_no_form_not_flagged(self):
+        html = "<html><body><h1>About us</h1><p>We make things.</p></body></html>"
+        self.assertFalse(es.detect_contact_form(html))
+
+
+class TestPageMetadataExtraction(unittest.TestCase):
+    def test_extracts_title_and_meta_description(self):
+        html = (
+            "<html><head><title>Acme Corp | Home</title>"
+            '<meta name="description" content="We build widgets."></head></html>'
+        )
+        meta = es.extract_page_metadata(html)
+        self.assertEqual(meta["page_title"], "Acme Corp | Home")
+        self.assertEqual(meta["meta_description"], "We build widgets.")
+
+    def test_extracts_og_tags(self):
+        html = (
+            "<html><head>"
+            '<meta property="og:title" content="Acme Corp">'
+            '<meta property="og:description" content="Widgets for everyone.">'
+            "</head></html>"
+        )
+        meta = es.extract_page_metadata(html)
+        self.assertEqual(meta["og_title"], "Acme Corp")
+        self.assertEqual(meta["og_description"], "Widgets for everyone.")
+
+    def test_missing_tags_default_to_empty_string(self):
+        meta = es.extract_page_metadata("<html><head></head><body></body></html>")
+        self.assertEqual(meta, {
+            "page_title": "", "meta_description": "", "og_title": "", "og_description": "",
+        })
+
+
+class TestFetchAndExtractPagesPageExtras(unittest.IsolatedAsyncioTestCase):
+    """has_contact_form and page metadata must surface through the same
+    return value as blocked_by, reusing already-fetched HTML — no extra
+    requests for either."""
+
+    async def test_has_contact_form_true_if_any_page_has_one(self):
+        class FormResp:
+            text = '<form class="hs-form"><input type="email" name="email"></form>'
+
+        class PlainResp:
+            text = "<h1>No form here</h1>"
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            return FormResp() if url == "https://x.com/contact" else PlainResp()
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch):
+            *_rest, page_extras = await es.fetch_and_extract_pages(
+                None, ["https://x.com/about", "https://x.com/contact"], robots, delay=0
+            )
+        self.assertTrue(page_extras["has_contact_form"])
+
+    async def test_metadata_comes_from_first_successful_page(self):
+        class FirstResp:
+            text = "<html><head><title>First Page</title></head></html>"
+
+        class SecondResp:
+            text = "<html><head><title>Second Page</title></head></html>"
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            return FirstResp() if url == "https://x.com/a" else SecondResp()
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch), \
+                unittest.mock.patch.object(es, "PER_DOMAIN_FETCH_WORKERS", 1):
+            *_rest, page_extras = await es.fetch_and_extract_pages(
+                None, ["https://x.com/a", "https://x.com/b"], robots, delay=0
+            )
+        self.assertEqual(page_extras["page_title"], "First Page")
+
+    async def test_no_form_and_no_metadata_when_nothing_fetched(self):
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            return None
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch):
+            *_rest, page_extras = await es.fetch_and_extract_pages(
+                None, ["https://x.com/dead"], robots, delay=0
+            )
+        self.assertEqual(page_extras, {
+            "has_contact_form": False, "page_title": "", "meta_description": "",
+            "og_title": "", "og_description": "", "mailto_emails": set(),
+        })
+
+
+class TestFetchAndExtractPagesBlockedSignature(unittest.IsolatedAsyncioTestCase):
+    """blocked_by must surface from either a rejected (non-200) response
+    whose body matched a signature, or a 200 response whose body itself is
+    a challenge page — fetch_and_extract_pages sees both through the same
+    per-page results loop."""
+
+    async def test_propagates_from_rejected_response(self):
+        class FakeResp:
+            text = "<h1>Welcome to Acme Corp</h1><p>hi@acme.com</p>"
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            if url == "https://x.com/blocked":
+                if blocked_sink is not None:
+                    blocked_sink.append("akamai")
+                return None
+            return FakeResp()
+
+        urls = ["https://x.com/blocked", "https://x.com/contact"]
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch):
+            _e, _sp, _ok, _ff, _p, _w, _s, blocked_by, _extras = await es.fetch_and_extract_pages(
+                None, urls, robots, delay=0
+            )
+        self.assertEqual(blocked_by, "akamai")
+
+    async def test_propagates_from_successful_challenge_page_body(self):
+        class ChallengeResp:
+            text = "<div class='cf-browser-verification'>Checking your browser...</div>"
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            return ChallengeResp()
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch):
+            _e, _sp, _ok, _ff, _p, _w, _s, blocked_by, _extras = await es.fetch_and_extract_pages(
+                None, ["https://x.com/"], robots, delay=0
+            )
+        self.assertEqual(blocked_by, "cloudflare")
+
+    async def test_no_signature_leaves_blocked_by_empty(self):
+        class FakeResp:
+            text = "<h1>Ordinary page</h1>"
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            return FakeResp()
+
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch):
+            *_rest, blocked_by, _extras = await es.fetch_and_extract_pages(
+                None, ["https://x.com/"], robots, delay=0
+            )
+        self.assertEqual(blocked_by, "")
+
+
+class TestIsRetryable(unittest.TestCase):
+    def test_connection_failed_is_retryable(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "none"
+        self.assertTrue(es._is_retryable(r))
+
+    def test_fetch_failed_is_retryable(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        r.fetch_failed = True
+        self.assertTrue(es._is_retryable(r))
+
+    def test_blocked_domain_is_not_retryable(self):
+        # A confirmed WAF/bot-challenge signature means retrying is pointless
+        # — it'll fail the same way every time.
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "none"
+        r.blocked_by = "cloudflare"
+        self.assertFalse(es._is_retryable(r))
+
+    def test_genuine_result_is_not_retryable(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.method = "sitemap"
+        self.assertFalse(es._is_retryable(r))
+
+
+class TestExtractMailtoEmails(unittest.TestCase):
+    def test_finds_mailto_link(self):
+        html = '<a href="mailto:hi@x.com">Email us</a>'
+        self.assertEqual(es.extract_mailto_emails(html), {"hi@x.com"})
+
+    def test_plain_text_email_not_included(self):
+        html = "<p>Reach us at hi@x.com or see our mailto link.</p>"
+        self.assertEqual(es.extract_mailto_emails(html), set())
+
+    def test_no_mailto_links_returns_empty_set(self):
+        self.assertEqual(es.extract_mailto_emails("<p>No links here.</p>"), set())
+
+
+class TestIsLowQualityEmailResult(unittest.TestCase):
+    def test_no_email_is_not_low_quality(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.domain = "x.com"
+        self.assertFalse(es._is_low_quality_email_result(r))
+
+    def test_own_domain_classified_email_is_not_low_quality(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.domain = "x.com"
+        r.emails = {"support@x.com"}
+        self.assertFalse(es._is_low_quality_email_result(r))
+
+    def test_third_party_only_is_low_quality(self):
+        # No email on the business's own domain at all — e.g. only a
+        # Zendesk/helpdesk-widget address was found.
+        r = es.DomainResult(input_url="https://x.com")
+        r.domain = "x.com"
+        r.emails = {"help@some-helpdesk-widget.com"}
+        self.assertTrue(es._is_low_quality_email_result(r))
+
+    def test_unclassifiable_own_domain_role_is_low_quality(self):
+        r = es.DomainResult(input_url="https://x.com")
+        r.domain = "x.com"
+        r.emails = {"xq7z@x.com"}  # classify_email_role -> "other"
+        self.assertTrue(es._is_low_quality_email_result(r))
+
 
 class TestSummarizeBatch(unittest.TestCase):
     def test_counts_each_bucket(self):
@@ -664,13 +1084,17 @@ class TestSummarizeBatch(unittest.TestCase):
             "c.com": "connection_failed",
             "d.com": "salvage_only",
             "e.com": "genuine_no_result",
+            "f.com": "permanently_blocked",
+            "g.com": "has_contact_form",
         }
         summary = es.summarize_batch(latest_category_by_url)
-        self.assertEqual(summary["total"], 5)
+        self.assertEqual(summary["total"], 7)
         self.assertEqual(summary["email_found"], 2)
         self.assertEqual(summary["connection_failed"], 1)
         self.assertEqual(summary["salvage_only"], 1)
         self.assertEqual(summary["genuine_no_result"], 1)
+        self.assertEqual(summary["permanently_blocked"], 1)
+        self.assertEqual(summary["has_contact_form"], 1)
 
     def test_empty_batch(self):
         summary = es.summarize_batch({})
@@ -751,15 +1175,65 @@ class TestPlaywrightSecondPassTargeting(unittest.IsolatedAsyncioTestCase):
 
         calls = []
 
-        async def fake_playwright_fallback(result, base_url, pages_to_check, delay,
-                                            salvage_phones, salvage_whatsapp, salvage_social):
+        class FakePlaywrightFetcher:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                pass
+
+        async def fake_fetch_and_extract(pf, result, base_url, pages_to_check, delay,
+                                          salvage_phones, salvage_whatsapp, salvage_social):
             calls.append(result.input_url)
 
-        with unittest.mock.patch.object(es, "playwright_fallback", fake_playwright_fallback):
+        with unittest.mock.patch.object(es, "PlaywrightFetcher", FakePlaywrightFetcher), \
+             unittest.mock.patch.object(es, "_playwright_fetch_and_extract", fake_fetch_and_extract):
             processed = [r async for r in es.run_playwright_second_pass(targets, delay=0)]
 
         self.assertEqual(calls, ["https://d.com"])
         self.assertEqual([r.input_url for r in processed], ["https://d.com"])
+
+    async def test_shares_one_browser_instance_across_all_targets(self):
+        # The whole point of Phase 0.2's fix: a batch second-pass must launch
+        # exactly ONE PlaywrightFetcher (one Chromium process) and reuse it
+        # across every domain, not construct a fresh one per domain.
+        d1 = es.DomainResult(input_url="https://d1.com")
+        d1.method = "sitemap"
+        d1.base_url = "https://d1.com"
+        d1.pages_checked = ["https://d1.com/contact"]
+
+        d2 = es.DomainResult(input_url="https://d2.com")
+        d2.method = "sitemap"
+        d2.base_url = "https://d2.com"
+        d2.pages_checked = ["https://d2.com/contact"]
+
+        instances_created = []
+
+        class FakePlaywrightFetcher:
+            def __init__(self):
+                instances_created.append(self)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                pass
+
+        seen_pf_per_call = []
+
+        async def fake_fetch_and_extract(pf, result, base_url, pages_to_check, delay,
+                                          salvage_phones, salvage_whatsapp, salvage_social):
+            seen_pf_per_call.append(pf)
+
+        with unittest.mock.patch.object(es, "PlaywrightFetcher", FakePlaywrightFetcher), \
+             unittest.mock.patch.object(es, "_playwright_fetch_and_extract", fake_fetch_and_extract):
+            processed = [r async for r in es.run_playwright_second_pass([d1, d2], delay=0)]
+
+        self.assertEqual(len(instances_created), 1)
+        self.assertEqual(len(seen_pf_per_call), 2)
+        self.assertIs(seen_pf_per_call[0], seen_pf_per_call[1])
+        self.assertIs(seen_pf_per_call[0], instances_created[0])
+        self.assertEqual([r.input_url for r in processed], ["https://d1.com", "https://d2.com"])
 
     async def test_reuses_stored_pages_checked_not_rediscovered(self):
         # The whole point of storing base_url/pages_checked is that the
@@ -782,6 +1256,306 @@ class TestPlaywrightSecondPassTargeting(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(seen_args["base_url"], "https://x.com")
         self.assertEqual(seen_args["pages_to_check"], ["https://x.com/contact", "https://x.com/about"])
+
+
+class TestDomainRateLimiter(unittest.IsolatedAsyncioTestCase):
+    async def test_enforces_minimum_interval(self):
+        limiter = es.DomainRateLimiter(min_interval=0.2)
+        t0 = time.monotonic()
+        await limiter.wait()
+        await limiter.wait()
+        elapsed = time.monotonic() - t0
+        self.assertGreaterEqual(elapsed, 0.2)
+
+    async def test_first_wait_does_not_block(self):
+        limiter = es.DomainRateLimiter(min_interval=5.0)
+        t0 = time.monotonic()
+        await limiter.wait()
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.0)
+
+    async def test_ensure_min_interval_widens_not_narrows(self):
+        limiter = es.DomainRateLimiter(min_interval=1.0)
+        limiter.ensure_min_interval(0.1)  # smaller -- must not narrow
+        self.assertEqual(limiter.min_interval, 1.0)
+        limiter.ensure_min_interval(5.0)  # larger -- must widen
+        self.assertEqual(limiter.min_interval, 5.0)
+
+    async def test_concurrent_waiters_still_serialize(self):
+        # Three concurrent callers on the SAME limiter must still be spaced
+        # out by min_interval cumulatively -- the lock across the await
+        # point inside wait() is what prevents them from all reading a
+        # stale last_request_time and proceeding together.
+        limiter = es.DomainRateLimiter(min_interval=0.15)
+        t0 = time.monotonic()
+        await asyncio.gather(limiter.wait(), limiter.wait(), limiter.wait())
+        elapsed = time.monotonic() - t0
+        self.assertGreaterEqual(elapsed, 0.15 * 2)
+
+
+class TestPickUserAgent(unittest.TestCase):
+    def test_always_returns_one_of_the_known_agents(self):
+        for _ in range(20):
+            self.assertIn(es._pick_user_agent(), es.USER_AGENTS)
+
+    def test_more_than_one_agent_available(self):
+        # The whole point of rotation is variety across requests.
+        self.assertGreater(len(es.USER_AGENTS), 1)
+
+
+class TestGetUserAgentForDomain(unittest.TestCase):
+    """A single domain must see the same UA across every request in a
+    crawl — switching UAs page-to-page within one domain's session is a
+    pattern no real browser exhibits and is more suspicious than either a
+    stable spoofed UA or a stable honest one."""
+
+    def setUp(self):
+        es._domain_user_agents.clear()
+
+    def test_same_domain_gets_same_agent_every_call(self):
+        first = es.get_user_agent_for_domain("https://x.com/a")
+        second = es.get_user_agent_for_domain("https://x.com/b")
+        third = es.get_user_agent_for_domain("https://www.x.com/c")  # www-stripped, same bare domain
+        self.assertEqual(first, second)
+        self.assertEqual(first, third)
+
+    def test_different_domains_get_independent_cache_entries(self):
+        es.get_user_agent_for_domain("https://a.com/")
+        es.get_user_agent_for_domain("https://b.com/")
+        self.assertEqual(set(es._domain_user_agents.keys()), {"a.com", "b.com"})
+
+
+class TestGetDomainRateLimiter(unittest.TestCase):
+    def test_same_bare_domain_returns_same_limiter(self):
+        a = es.get_domain_rate_limiter("https://www.example-rl-test.com/foo")
+        b = es.get_domain_rate_limiter("https://example-rl-test.com/bar")
+        self.assertIs(a, b)
+
+    def test_different_domains_get_different_limiters(self):
+        a = es.get_domain_rate_limiter("https://one-rl-test.com/")
+        b = es.get_domain_rate_limiter("https://two-rl-test.com/")
+        self.assertIsNot(a, b)
+
+
+class TestRobotsCrawlDelay(unittest.TestCase):
+    def _policy(self, body, enabled=True):
+        parser = robotparser.RobotFileParser()
+        parser.parse(body.splitlines())
+        return es.RobotsPolicy(parser, [], enabled=enabled)
+
+    def test_crawl_delay_present(self):
+        p = self._policy("User-agent: *\nCrawl-delay: 7\nDisallow: /private/\n")
+        self.assertEqual(p.crawl_delay(), 7.0)
+
+    def test_crawl_delay_absent(self):
+        p = self._policy("User-agent: *\nDisallow: /private/\n")
+        self.assertIsNone(p.crawl_delay())
+
+    def test_crawl_delay_none_when_disabled(self):
+        p = self._policy("User-agent: *\nCrawl-delay: 7\n", enabled=False)
+        self.assertIsNone(p.crawl_delay())
+
+    def test_crawl_delay_none_when_no_parser(self):
+        p = es.RobotsPolicy(None, [], enabled=True)
+        self.assertIsNone(p.crawl_delay())
+
+
+class TestExponentialBackoffWithJitter(unittest.TestCase):
+    def test_within_bounds(self):
+        for attempt in range(6):
+            for _ in range(20):
+                delay = es._exponential_backoff_with_jitter(attempt, base=1.0, cap=10.0)
+                self.assertGreaterEqual(delay, 0.0)
+                self.assertLessEqual(delay, min(10.0, 1.0 * (2 ** attempt)))
+
+    def test_capped_for_large_attempt(self):
+        for _ in range(20):
+            delay = es._exponential_backoff_with_jitter(attempt=10, base=1.0, cap=10.0)
+            self.assertLessEqual(delay, 10.0)
+
+    def test_produces_variation_not_a_fixed_value(self):
+        # Full jitter means repeated calls at the same attempt number
+        # shouldn't all return the identical value.
+        samples = {es._exponential_backoff_with_jitter(3, base=1.0, cap=10.0) for _ in range(30)}
+        self.assertGreater(len(samples), 1)
+
+
+class TestFetchAndExtractPagesEarlyStop(unittest.IsolatedAsyncioTestCase):
+    """Politeness, not just speed: once a high-confidence (top-ranked)
+    candidate yields an email and the configured minimum has been checked,
+    the remaining lower-ranked candidates must never be requested at all —
+    not just have their results discarded."""
+
+    async def test_stops_after_first_wave_when_email_found(self):
+        requested = []
+
+        class FakeResp:
+            def __init__(self, text):
+                self.text = text
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            requested.append(url)
+            if url == "https://x.com/p1":
+                return FakeResp("<p>reach us at hello@x.com</p>")
+            return FakeResp("<p>nothing here</p>")
+
+        urls = [f"https://x.com/p{i}" for i in range(1, 7)]  # 6 candidates
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch), \
+                unittest.mock.patch.object(es, "PER_DOMAIN_FETCH_WORKERS", 4):
+            emails, _sp, fetched_ok, _ff, *_ = await es.fetch_and_extract_pages(
+                None, urls, robots, delay=0, min_pages_before_stop=3
+            )
+
+        self.assertEqual(emails, {"hello@x.com"})
+        # Only the first wave (4 pages) should ever have been requested —
+        # the remaining 2 (lower-ranked) candidates must not be fetched.
+        self.assertEqual(len(requested), 4)
+        self.assertNotIn("https://x.com/p5", requested)
+        self.assertNotIn("https://x.com/p6", requested)
+
+    async def test_respects_minimum_pages_before_stopping(self):
+        # With a wave size of 1, an email on the very first page still
+        # shouldn't stop the whole fetch if min_pages_before_stop requires
+        # more pages to be checked first.
+        requested = []
+
+        class FakeResp:
+            def __init__(self, text):
+                self.text = text
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            requested.append(url)
+            if url == "https://x.com/p1":
+                return FakeResp("<p>reach us at hello@x.com</p>")
+            return FakeResp("<p>nothing here</p>")
+
+        urls = [f"https://x.com/p{i}" for i in range(1, 6)]
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch), \
+                unittest.mock.patch.object(es, "PER_DOMAIN_FETCH_WORKERS", 1):
+            await es.fetch_and_extract_pages(None, urls, robots, delay=0, min_pages_before_stop=3)
+
+        # Should stop right at the minimum (3 waves of 1), not continue to
+        # p4/p5, and not stop after just p1 either.
+        self.assertEqual(len(requested), 3)
+
+    async def test_cancellation_during_stagger_sleep_cancels_orphaned_tasks(self):
+        # Regression test: a real batch run surfaced "RuntimeError: Session
+        # is closed" from tasks created via create_task() in the stagger
+        # loop, before gather() was ever reached, when the per-domain hard
+        # timeout cancelled fetch_and_extract_pages mid-stagger. Those tasks
+        # were orphaned (never gathered, so gather's cancellation-propagation
+        # never applied) and kept running after the caller's session closed.
+        started = []
+        cancelled = []
+
+        async def fake_fetch(session, url, proxy=None, blocked_sink=None):
+            started.append(url)
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.append(url)
+                raise
+            return None
+
+        urls = [f"https://x.com/p{i}" for i in range(1, 6)]
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch), \
+                unittest.mock.patch.object(es, "PER_DOMAIN_FETCH_WORKERS", 5):
+            with self.assertRaises((TimeoutError, asyncio.TimeoutError)):
+                await asyncio.wait_for(
+                    es.fetch_and_extract_pages(None, urls, robots, delay=0.05),
+                    timeout=0.12,
+                )
+
+        # Let the cancellation fully propagate before asserting.
+        await asyncio.sleep(0.05)
+
+        self.assertGreater(len(started), 0)
+        self.assertEqual(set(started), set(cancelled))
+
+    async def test_checks_all_pages_when_nothing_found(self):
+        async def fake_fetch_empty(session, url, proxy=None, blocked_sink=None):
+            class FakeResp:
+                text = "<p>nothing here at all</p>"
+            return FakeResp()
+
+        urls = [f"https://x.com/p{i}" for i in range(1, 8)]
+        robots = es.RobotsPolicy(None, [], enabled=False)
+        with unittest.mock.patch.object(es, "fetch", fake_fetch_empty), \
+                unittest.mock.patch.object(es, "PER_DOMAIN_FETCH_WORKERS", 4):
+            emails, _sp, fetched_ok, _ff, *_ = await es.fetch_and_extract_pages(
+                None, urls, robots, delay=0, min_pages_before_stop=3
+            )
+
+        self.assertEqual(emails, set())
+        self.assertEqual(fetched_ok, 7)  # every candidate checked, none skipped
+
+
+class TestFinalizeCsv(unittest.TestCase):
+    """A domain touched by a retry or Playwright second pass gets a fresh
+    writerow() call on top of its main-pass row — without a final collapse
+    step, the CSV ends up with duplicate rows per domain. Confirmed for
+    real against an 81-domain batch (4 duplicate rows, one per domain that
+    went through the Playwright second pass)."""
+
+    def _make_result(self, url, method, error, emails=None):
+        r = es.DomainResult(input_url=url)
+        r.domain = es.get_bare_domain(url)
+        r.method = method
+        r.error = error
+        if emails:
+            r.emails = set(emails)
+        return r
+
+    def test_collapses_duplicate_rows_to_latest_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.csv")
+            first_pass = self._make_result(
+                "https://a.com", "sitemap", "no emails found on checked pages"
+            )
+            second_pass = self._make_result(
+                "https://a.com", "sitemap",
+                "no emails found on checked pages (incl. JS-rendered)",
+            )
+            other = self._make_result("https://b.com", "none", "domain unreachable")
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=es.CSV_FIELDNAMES)
+                writer.writeheader()
+                writer.writerow(es.result_to_row(first_pass))
+                writer.writerow(es.result_to_row(other))
+                writer.writerow(es.result_to_row(second_pass))  # duplicate for a.com
+
+            es._finalize_csv(path, {"https://a.com": second_pass, "https://b.com": other})
+
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        self.assertEqual(len(rows), 2)
+        a_row = next(r for r in rows if r["input_url"] == "https://a.com")
+        self.assertEqual(a_row["error"], "no emails found on checked pages (incl. JS-rendered)")
+
+    def test_leaves_untouched_resume_rows_alone(self):
+        # Rows for domains not in latest_result_by_url (carried over from a
+        # prior --resume run) must survive the collapse unchanged.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.csv")
+            prior_run = self._make_result("https://old.com", "sitemap", "", emails=["hi@old.com"])
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=es.CSV_FIELDNAMES)
+                writer.writeheader()
+                writer.writerow(es.result_to_row(prior_run))
+
+            es._finalize_csv(path, {})  # this run touched nothing from the prior file
+
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["input_url"], "https://old.com")
 
 
 if __name__ == "__main__":

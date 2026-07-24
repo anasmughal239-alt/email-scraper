@@ -54,6 +54,14 @@ from bs4 import BeautifulSoup
 # Config / constants
 # --------------------------------------------------------------------------
 
+# Reverted from an honest, self-identifying UA (kept above in git history)
+# after a controlled A/B test on a real 81-domain batch measured its actual
+# cost: 5% vs 11% email_found, 86% vs 73% connection_failed, attributable to
+# the UA alone with everything else held identical. Explicit decision to
+# prioritize yield over the honest-crawler convention — the project's
+# no-evasion stance (still in force for CAPTCHA/anti-bot bypass, WAF
+# workarounds, and fingerprint spoofing beyond the UA string) is unchanged
+# elsewhere; this is a scoped, measured, user-approved exception.
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36",
@@ -63,6 +71,30 @@ USER_AGENTS = [
     "Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
+
+
+def _pick_user_agent() -> str:
+    return random.choice(USER_AGENTS)
+
+
+# Keyed by bare domain, mirroring _domain_rate_limiters below — a UA picked
+# fresh on every single request meant different pages of the SAME domain
+# could get different browser strings within one crawl, which no real
+# browser session ever does and is a more suspicious pattern than either a
+# stable spoofed UA or the stable honest UA this replaced. One UA per
+# domain, reused for every request to it (sitemap, robots.txt, candidate
+# pages, Playwright) for the life of the process, while still varying
+# across different domains in the same batch.
+_domain_user_agents: dict = {}
+
+
+def get_user_agent_for_domain(url: str) -> str:
+    key = get_bare_domain(url)
+    ua = _domain_user_agents.get(key)
+    if ua is None:
+        ua = _pick_user_agent()
+        _domain_user_agents[key] = ua
+    return ua
 
 COMMON_SITEMAP_PATHS = [
     "/sitemap.xml",
@@ -111,6 +143,23 @@ HARD_CONTACT_KEYWORDS = {
     "neem-contact-op", "over-ons",
 }
 MAX_SOFT_MATCH_DEPTH = 2  # soft keywords only count on paths this shallow or less
+
+# Among hard (whole-segment) matches, an explicit "contact us" phrase is a
+# stronger signal than "about us" — an about page describes the company but
+# rarely lists a direct contact address, while a contact page's entire
+# purpose is exactly that. Both previously scored identically as "hard
+# matches", so ties (e.g. /contact vs /about-us, both depth 1) were broken
+# arbitrarily by whichever URL happened to appear first in the sitemap.
+PRIMARY_HARD_CONTACT_KEYWORDS = {
+    "contact", "contact-us", "contactus", "get-in-touch", "getintouch",
+    "reach-us", "reach-out", "customer-service", "customer-support",
+    "contacto", "contactenos", "contactanos",
+    "contactez-nous", "nous-contacter",
+    "kontakt", "kontaktiere-uns",
+    "contatti",
+    "contato", "fale-conosco",
+    "neem-contact-op",
+}
 
 # NOTE ON LANGUAGE COVERAGE: the above covers Latin-script European languages,
 # which fit this scraper's path/token-matching approach. CJK, Arabic, and
@@ -178,10 +227,14 @@ EMAIL_RE = re.compile(
 )
 
 # "name [at] domain [dot] com" / "name (at) domain (dot) com" / "name AT domain DOT com"
+# The trailing optional group handles two-part ccTLDs ("domain [dot] co
+# [dot] uk", "domain [dot] com [dot] au") — without it, only "co"/"com" was
+# captured as the whole TLD and the real ".uk"/".au" was silently dropped.
 OBFUSCATED_EMAIL_RE = re.compile(
     r"([a-zA-Z0-9._%+\-]{1,64})\s*[\[\(]?\s*(?:at|AT|@)\s*[\]\)]?\s*"
     r"([a-zA-Z0-9.\-]{1,253})\s*[\[\(]?\s*(?:dot|DOT)\s*[\]\)]?\s*"
     r"([a-zA-Z]{2,24})"
+    r"(?:\s*[\[\(]?\s*(?:dot|DOT)\s*[\]\)]?\s*([a-zA-Z]{2,24}))?"
 )
 
 REQUEST_TIMEOUT = 12
@@ -218,7 +271,13 @@ RETRY_COOLDOWN_SECONDS = 15
 # already showed some sign of trouble once.
 RETRY_MAX_WORKERS = 4
 MAX_SITEMAP_DEPTH = 3
-MAX_PAGES_PER_DOMAIN = 10
+# Raised from 10 -> 20 to widen crawl breadth per domain: a domain whose real
+# contact page ranks 11th-20th among candidates (large sites with many
+# location/office pages, or a sitemap with several near-miss URLs ahead of
+# the real one) was previously cut off before ever being fetched. Doesn't
+# affect domains that already find an email early — MIN_PAGES_BEFORE_EARLY_STOP
+# still stops the fetch loop once a high-confidence candidate answers.
+MAX_PAGES_PER_DOMAIN = 20
 # Large e-commerce/blog sites can have sitemap trees with thousands of child
 # files (per-locale, per-collection, per-year archives). Cap total sitemap
 # fetches per domain so one domain can't stall the whole batch.
@@ -246,11 +305,22 @@ SITEMAP_FETCH_WORKERS = 6
 # Extra same-domain links tried when sitemap + footer both find nothing —
 # a shallow second hop rather than a full crawl, to catch contact pages
 # that aren't sitemap-listed and aren't linked from the footer specifically.
-MAX_SECOND_HOP_LINKS = 5
+# Raised from 5 -> 8 alongside MAX_PAGES_PER_DOMAIN, same rationale: more
+# candidates get a real chance before giving up.
+MAX_SECOND_HOP_LINKS = 8
 # How many candidate pages to fetch concurrently within a single domain —
 # these fetches are independent of each other, so there's no reason to
-# fetch them one at a time.
-PER_DOMAIN_FETCH_WORKERS = 4
+# fetch them one at a time. Raised from 4 -> 6 to keep wall-clock time
+# reasonable now that up to 20 (not 10) candidates may need fetching.
+PER_DOMAIN_FETCH_WORKERS = 6
+# Candidate pages arrive already ranked best-first (rank_contact_urls).
+# Fetching happens in waves of PER_DOMAIN_FETCH_WORKERS pages at a time;
+# once an email has been found AND at least this many pages have been
+# checked, the remaining (lower-ranked) waves are skipped rather than
+# fetched anyway — a politeness measure (don't request pages the answer no
+# longer needs), not just a speed one. Kept independent of wave size so
+# it's tunable without changing per-domain concurrency.
+MIN_PAGES_BEFORE_EARLY_STOP = 3
 # User-agent token used when matching a site's robots.txt rules. We present
 # as a generic bot ("*"), so we obey the rules any site sets for all crawlers.
 ROBOTS_USER_AGENT = "*"
@@ -377,20 +447,25 @@ def classify_email_role(email: str) -> str:
     return "other"
 
 
-def rank_emails_by_role(emails) -> list:
-    """Sort emails best-outreach-contact-first by role priority, tie-broken
+def rank_emails_by_role(emails, mailto_emails: Optional[set] = None) -> list:
+    """Sort emails best-outreach-contact-first by role priority. Within the
+    same role, a mailto:-sourced email is preferred over one that merely
+    appeared in body text — a mailto link is a deliberate "this is our
+    contact address" signal from the site owner, while a plain-text match
+    could be a testimonial, a partner mentioned in passing, etc. Tie-broken
     alphabetically for stable output."""
+    mailto_emails = mailto_emails or set()
     return sorted(
         emails,
-        key=lambda e: (ROLE_PRIORITY.get(classify_email_role(e), 99), e),
+        key=lambda e: (ROLE_PRIORITY.get(classify_email_role(e), 99), e not in mailto_emails, e),
     )
 
 
-def pick_primary_email(own_emails: list, other_emails: list) -> tuple:
+def pick_primary_email(own_emails: list, other_emails: list, mailto_emails: Optional[set] = None) -> tuple:
     """Choose the single best contact email (prefer the company's own domain
     over third-party), returning (email, role) or ('', '')."""
-    ranked_own = rank_emails_by_role(own_emails)
-    ranked_other = rank_emails_by_role(other_emails)
+    ranked_own = rank_emails_by_role(own_emails, mailto_emails)
+    ranked_other = rank_emails_by_role(other_emails, mailto_emails)
     best = (ranked_own or ranked_other)
     if not best:
         return "", ""
@@ -430,6 +505,29 @@ class DomainResult:
     # measurement of Playwright's own cost with redundant re-scraping cost.
     base_url: str = ""
     pages_checked: list = field(default_factory=list)
+    # Set to a vendor name ("cloudflare"/"akamai"/"perimeterx") when a
+    # fetched page matched a known WAF/bot-challenge block-page signature —
+    # detection only, never used to bypass anything. Lets classify_domain_result
+    # distinguish a structurally-blocked domain (retrying is pointless) from
+    # an ordinary connection failure or a genuine "no result".
+    blocked_by: str = ""
+    # True if any checked page contained a genuine contact form (a form
+    # builder/service marker, or the generic email+message-field shape) —
+    # lets classify_domain_result split "no email, but there's still a way
+    # to reach them" out of genuine_no_result instead of reporting both
+    # identically as "truly nothing here".
+    has_contact_form: bool = False
+    # Metadata from the first page that was successfully fetched — reused
+    # HTML, no extra requests. Useful for personalizing outreach even when
+    # no email was found.
+    page_title: str = ""
+    meta_description: str = ""
+    og_title: str = ""
+    og_description: str = ""
+    # Subset of `emails` that came specifically from a mailto: link, across
+    # every page checked — used as a tiebreaker so a deliberately-placed
+    # contact address outranks one that merely appeared in body text.
+    mailto_emails: set = field(default_factory=set)
 
 
 # --------------------------------------------------------------------------
@@ -519,6 +617,76 @@ def new_client_session(timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
     )
 
 
+# --------------------------------------------------------------------------
+# Per-domain rate limiting (politeness — not related to anti-bot evasion)
+# --------------------------------------------------------------------------
+
+# Default cap: at most 2 requests/second to any single domain, regardless
+# of how many workers/domains the batch overall is running concurrently.
+# Concurrency elsewhere in this module (PER_DOMAIN_FETCH_WORKERS,
+# SITEMAP_FETCH_WORKERS, --workers) bounds how many requests CAN be in
+# flight at once; it says nothing about how fast a single domain actually
+# gets hit if enough of those slots happen to be free simultaneously. This
+# closes that gap independently of concurrency settings.
+DEFAULT_PER_DOMAIN_RATE_LIMIT = 2.0  # requests/second
+DEFAULT_PER_DOMAIN_MIN_INTERVAL = 1.0 / DEFAULT_PER_DOMAIN_RATE_LIMIT
+
+
+class DomainRateLimiter:
+    """Enforces a minimum interval between requests to one domain, shared
+    across every concurrent fetch operation for that domain (sitemap
+    files, candidate pages, robots.txt, the homepage) — a simple
+    leaky-bucket-of-one rather than a full token bucket, since the goal is
+    "never faster than X req/s to this domain," not "allow occasional
+    bursts." The asyncio.Lock is required because .wait() has an await
+    point (the sleep) inside its critical section — without it, multiple
+    concurrent tasks could all read the same stale last_request_time
+    before any of them updates it, defeating the whole point."""
+
+    def __init__(self, min_interval: float = DEFAULT_PER_DOMAIN_MIN_INTERVAL):
+        self.min_interval = min_interval
+        self._lock = asyncio.Lock()
+        self._last_request_time = 0.0
+
+    def ensure_min_interval(self, min_interval: float) -> None:
+        """Widens (never narrows) the enforced interval — used when a
+        site's own robots.txt Crawl-delay asks for something slower than
+        our default; whichever is more conservative wins."""
+        self.min_interval = max(self.min_interval, min_interval)
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < self.min_interval:
+                await asyncio.sleep(self.min_interval - elapsed)
+            self._last_request_time = time.monotonic()
+
+
+# Keyed by bare domain (get_bare_domain — no "www.", no scheme), so
+# www.example.com and example.com share one budget rather than each
+# getting their own. A plain module-level dict is safe here without its
+# own lock: asyncio is single-threaded/cooperative, and dict get/set has no
+# `await` inside it, so no other coroutine can interleave mid-mutation.
+# Left to live for the process's lifetime (each entry is a lock + two
+# floats + a short string — even tens of thousands of domains across a
+# long-lived dashboard process amount to a few hundred KB at most).
+_domain_rate_limiters: dict = {}
+
+
+def _rate_limit_key(url: str) -> str:
+    return get_bare_domain(url)
+
+
+def get_domain_rate_limiter(url: str, min_interval: float = DEFAULT_PER_DOMAIN_MIN_INTERVAL) -> DomainRateLimiter:
+    key = _rate_limit_key(url)
+    limiter = _domain_rate_limiters.get(key)
+    if limiter is None:
+        limiter = DomainRateLimiter(min_interval)
+        _domain_rate_limiters[key] = limiter
+    return limiter
+
+
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     """Parses a Retry-After header, which per RFC 7231 is either an integer
     number of seconds or an HTTP-date. Returns None if missing/unparseable
@@ -540,16 +708,64 @@ def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     return max(delay, 0.0)
 
 
+# Cap on the backoff computed below — an unlucky high attempt number
+# shouldn't be allowed to wait minutes before retrying within one domain's
+# overall time budget (DOMAIN_HARD_TIMEOUT_SECONDS).
+MAX_BACKOFF_SECONDS = 10.0
+
+
+def _exponential_backoff_with_jitter(attempt: int, base: float = 1.0,
+                                      cap: float = MAX_BACKOFF_SECONDS) -> float:
+    """Exponential backoff (base * 2^attempt) with *full* jitter — a random
+    value between 0 and the computed ceiling, not the ceiling itself. Full
+    jitter (rather than a fixed delay, or a delay +/- a small percentage)
+    is the standard approach for avoiding synchronized retry storms when
+    many concurrent requests fail around the same time; see AWS's
+    "Exponential Backoff and Jitter" architecture-blog post for the
+    canonical treatment. Used for unprompted failures (timeouts, connection
+    resets, 5xx without a Retry-After) — a 429 with an actual Retry-After
+    value is still honored in preference to this, since a server that
+    tells us how long to wait should be trusted over our own guess."""
+    ceiling = min(cap, base * (2 ** attempt))
+    return random.uniform(0, ceiling)
+
+
+async def _note_blocked_signature(resp, blocked_sink: Optional[list]) -> None:
+    """Reads a response body that's about to be discarded (a non-200,
+    non-retryable status, or a retryable one that exhausted every attempt)
+    and checks it for a known WAF/bot-challenge signature before it's lost.
+    A domain's dominant "unreachable" failure mode in real batches turned
+    out to be exactly this case — a WAF returning e.g. 403 outright, whose
+    body was never even read because fetch() only kept bodies from 200
+    responses. blocked_sink is an in/out list (not a return value) so this
+    can be called from inside an already-open `async with resp:` block
+    without changing fetch()'s existing None-on-failure contract."""
+    if blocked_sink is None:
+        return
+    try:
+        content = await resp.read()
+        text = content.decode(resp.charset or "utf-8", errors="replace")
+    except Exception:
+        return
+    vendor = detect_blocked_signature(text)
+    if vendor:
+        blocked_sink.append(vendor)
+
+
 async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = REQUEST_TIMEOUT,
-                 proxy: Optional[str] = None) -> Optional[_FetchResponse]:
+                 proxy: Optional[str] = None,
+                 rate_limiter: Optional["DomainRateLimiter"] = None,
+                 blocked_sink: Optional[list] = None) -> Optional[_FetchResponse]:
     headers = {
-        "User-Agent": random.choice(USER_AGENTS),
+        "User-Agent": get_user_agent_for_domain(url),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
     client_timeout = aiohttp.ClientTimeout(total=timeout)
     attempts = 3  # 1 initial try + 2 retries, matching the old urllib3 Retry(total=2, ...)
+    limiter = rate_limiter or get_domain_rate_limiter(url)
     for attempt in range(attempts):
+        await limiter.wait()
         try:
             async with session.get(url, headers=headers, timeout=client_timeout,
                                     allow_redirects=True, proxy=proxy) as resp:
@@ -561,22 +777,30 @@ async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = REQUEST
                         text = content.decode("utf-8", errors="replace")
                     return _FetchResponse(text=text, content=content)
                 if resp.status in (429, 500, 502, 503, 504) and attempt < attempts - 1:
-                    delay = 1.2 * (attempt + 1)
+                    # Honoring a 429's actual requested delay (capped, so one slow
+                    # server can't eat a large share of the domain's time budget) is
+                    # the standard-compliant behavior — this is what separates a
+                    # well-behaved crawler from one that just hammers through rate
+                    # limits with a fixed backoff. When there's no such explicit
+                    # guidance (a 429 with no Retry-After, or any other 5xx), fall
+                    # back to exponential backoff with full jitter rather than a
+                    # fixed linear delay — spreads out retries from multiple
+                    # concurrently-failing requests instead of having them all
+                    # retry in lockstep.
+                    delay = None
                     if resp.status == 429:
-                        # Honoring the server's actual requested delay (capped, so one
-                        # slow server can't eat a large share of the domain's time
-                        # budget) is the standard-compliant behavior for a 429 — this
-                        # is what separates a well-behaved crawler from one that just
-                        # hammers through rate limits with a fixed backoff.
                         retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
                         if retry_after is not None:
                             delay = min(retry_after, MAX_RETRY_AFTER_SECONDS)
+                    if delay is None:
+                        delay = _exponential_backoff_with_jitter(attempt)
                     await asyncio.sleep(delay)
                     continue
+                await _note_blocked_signature(resp, blocked_sink)
                 return None
         except (aiohttp.ClientError, asyncio.TimeoutError):
             if attempt < attempts - 1:
-                await asyncio.sleep(1.2 * (attempt + 1))
+                await asyncio.sleep(_exponential_backoff_with_jitter(attempt))
                 continue
             return None
     return None
@@ -604,10 +828,12 @@ async def probe_domain_reachable(base_url: str, proxy: Optional[str] = None) -> 
     hiccup, a momentary connection refusal — a real chance to have cleared,
     rather than just re-asking the same question a few milliseconds later."""
     timeout = aiohttp.ClientTimeout(total=FAST_FAIL_PROBE_TIMEOUT)
+    limiter = get_domain_rate_limiter(base_url)
     for attempt in range(2):
+        await limiter.wait()
         try:
             async with new_client_session(timeout) as session:
-                async with session.get(base_url, headers={"User-Agent": random.choice(USER_AGENTS)},
+                async with session.get(base_url, headers={"User-Agent": get_user_agent_for_domain(base_url)},
                                         allow_redirects=True, proxy=proxy):
                     return True
         except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -730,6 +956,19 @@ class RobotsPolicy:
             return self._parser.can_fetch(ROBOTS_USER_AGENT, url)
         except Exception:
             return True  # never let a robotparser quirk block the whole run
+
+    def crawl_delay(self) -> Optional[float]:
+        """The site's own declared Crawl-delay in seconds, or None if it
+        didn't specify one. Used to widen (never narrow) the per-domain
+        rate limiter's minimum interval — whichever is more conservative
+        between our own default and the site's stated preference wins."""
+        if not self.enabled or self._parser is None:
+            return None
+        try:
+            value = self._parser.crawl_delay(ROBOTS_USER_AGENT)
+        except Exception:
+            return None
+        return float(value) if value is not None else None
 
 
 async def fetch_robots_policy(session: aiohttp.ClientSession, base_url: str,
@@ -941,7 +1180,11 @@ def rank_contact_urls(urls: list, base_url: str, limit: int = MAX_PAGES_PER_DOMA
         # direct test before this fix: the compound-slug example above
         # scored 4.5 against /contact's 2.0 and ranked first.
         if hard_segment_matches:
-            score = 100 + depth_bonus
+            # An explicit "contact us"-style hard match outranks other hard
+            # matches (e.g. "about us") at the same depth — see
+            # PRIMARY_HARD_CONTACT_KEYWORDS above.
+            priority_bonus = 10 if hard_segment_matches & PRIMARY_HARD_CONTACT_KEYWORDS else 0
+            score = 100 + priority_bonus + depth_bonus
         else:
             score = len(matched) + depth_bonus
         scored.append((score, url))
@@ -1034,8 +1277,9 @@ def extract_cloudflare_emails(html: str) -> set:
 def extract_obfuscated_emails(text: str) -> set:
     found = set()
     for m in OBFUSCATED_EMAIL_RE.finditer(text):
-        local, domain, tld = m.groups()
-        found.add(f"{local}@{domain}.{tld}".lower())
+        local, domain, tld, second_tld = m.groups()
+        full_tld = f"{tld}.{second_tld}" if second_tld else tld
+        found.add(f"{local}@{domain}.{full_tld}".lower())
     return found
 
 
@@ -1069,12 +1313,64 @@ def is_valid_candidate(email: str) -> bool:
     return True
 
 
+# Script tags whose content is genuine structured data, not page logic —
+# safe to json.loads() and walk for string values, unlike the free-form JS
+# leak-risk this module already stripped scripts to avoid.
+_JSON_SCRIPT_TYPE_RE = re.compile(r"^application/(ld\+)?json$", re.IGNORECASE)
+_HYDRATION_SCRIPT_ID_RE = re.compile(r"__NEXT_DATA__|__NUXT_DATA__|__remix", re.IGNORECASE)
+
+
+def _walk_json_for_emails(node) -> set:
+    """Iterative (not recursive) walk so a deeply-nested real-world JSON
+    blob can't hit Python's recursion limit."""
+    found = set()
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            found |= set(EMAIL_RE.findall(item))
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return found
+
+
+def extract_emails_from_json_hydration(html: str) -> set:
+    """Modern frameworks (Next.js, Nuxt, Remix) embed page data as a JSON
+    blob in a dedicated <script> tag rather than rendering contact info
+    directly into visible HTML — a static fetch sees the JSON but the
+    ordinary text scan below never looks inside <script> tags (deliberately,
+    per the leak-risk comment above). This parses the JSON properly with
+    json.loads and walks only genuine string values, so — unlike a raw regex
+    scan of script text — it can't produce a malformed partial match from an
+    HTML-escaped fragment."""
+    emails = set()
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = soup.find_all("script", attrs={"type": _JSON_SCRIPT_TYPE_RE})
+    candidates += soup.find_all("script", id=_HYDRATION_SCRIPT_ID_RE)
+    for tag in candidates:
+        text = tag.string or tag.get_text()
+        if not text or not text.strip():
+            continue
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            continue
+        emails |= _walk_json_for_emails(data)
+    return emails
+
+
 def extract_emails_from_html(html: str) -> set:
     emails = set()
     # Cloudflare-obfuscated emails live in a data-cfemail attribute or
     # cdn-cgi link even inside <script>, so decode these from the raw HTML
     # before stripping scripts below.
     emails |= extract_cloudflare_emails(html)
+    # Genuine structured-data JSON blobs (parsed, not regexed) — safe to
+    # read before the script-stripping below since json.loads() can't
+    # produce the escaped-fragment false positives a raw text scan risks.
+    emails |= extract_emails_from_json_hydration(html)
 
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
@@ -1095,6 +1391,25 @@ def extract_emails_from_html(html: str) -> set:
     emails |= extract_obfuscated_emails(visible_text)
 
     return {e.lower() for e in emails if is_valid_candidate(e)}
+
+
+def extract_mailto_emails(html: str) -> set:
+    """Emails specifically sourced from a mailto: link — a deliberate "this
+    is our contact address" signal from the site owner, stronger than one
+    that merely appears in body text (which could be a testimonial, a
+    partner mentioned in passing, a footer copyright line, etc.). Used as a
+    tiebreaker in rank_emails_by_role/pick_primary_email so a mailto-sourced
+    email is preferred as the primary contact over a same-role plain-text
+    one — not a new extraction path, just tagging a subset of what
+    extract_emails_from_html already finds."""
+    soup = BeautifulSoup(html, "html.parser")
+    found = set()
+    for a in soup.find_all("a", href=True):
+        if a["href"].lower().startswith("mailto:"):
+            addr = a["href"][7:].split("?")[0].strip()
+            if addr:
+                found.add(addr.lower())
+    return {e for e in found if is_valid_candidate(e)}
 
 
 # --------------------------------------------------------------------------
@@ -1170,15 +1485,124 @@ def extract_social_links_from_html(html: str) -> set:
     return found
 
 
+# Each vendor maps to a list of match sets; a vendor matches if ANY set's
+# substrings are ALL present (case-insensitive) in the page body. Substrings
+# are chosen to be distinctive enough that an ordinary page wouldn't contain
+# them by coincidence — e.g. "access denied" alone is too generic, but
+# paired with "reference #" (Akamai's standard error-page format) it isn't.
+# Detection only, per explicit project policy: this identifies and labels a
+# structurally-blocked domain so --retry-failed stops wasting a retry pass
+# on it, never to bypass, solve, or work around the challenge itself.
+_BLOCK_SIGNATURES = {
+    "cloudflare": [
+        ["cf-browser-verification"],
+        ["cdn-cgi/challenge-platform"],
+        ["attention required! | cloudflare"],
+    ],
+    "akamai": [
+        ["akamaighost"],
+        ["access denied", "reference #"],
+    ],
+    "perimeterx": [
+        ["px-captcha"],
+        ["_pxcaptcha"],
+        ["please verify you are a human", "perimeterx"],
+    ],
+}
+
+
+def detect_blocked_signature(html: str) -> str:
+    """Returns the vendor name ("cloudflare"/"akamai"/"perimeterx") if the
+    page body matches a known WAF/bot-challenge block-page signature, else
+    "". Runs against HTML already fetched for extraction — no extra
+    requests — so a domain that's structurally blocked (will never yield an
+    email no matter how many times it's retried) can be labeled distinctly
+    from an ordinary connection failure or a real "checked and empty"
+    result."""
+    if not html:
+        return ""
+    lowered = html.lower()
+    for vendor, rule_sets in _BLOCK_SIGNATURES.items():
+        for rule_set in rule_sets:
+            if all(marker in lowered for marker in rule_set):
+                return vendor
+    return ""
+
+
+# Builder-specific form markers (id/class/action/name substrings) — covers
+# the most common contact-form plugins/services so a themed or JS-styled
+# form is still recognized even when it doesn't literally contain an
+# <input type="email"> (e.g. some builders render email fields as type="text"
+# with JS-side validation).
+_CONTACT_FORM_MARKERS_RE = re.compile(
+    r'wpcf7-form|gform_wrapper|hs-form|freshworks_button|formspree|netlify-form|'
+    r'contact-form|contactform|contact_form',
+    re.IGNORECASE,
+)
+
+
+def detect_contact_form(html: str) -> bool:
+    """Detects a genuine contact form on an already-fetched page — reused
+    HTML, no extra requests. A form counts if it matches a known form-
+    builder/service marker (WPCF7, Gravity Forms, HubSpot, Formspree,
+    Netlify Forms, or an explicit "contact-form"-style id/class/action), or
+    — for anything else — has the generic shape of a contact form: an email
+    field alongside a free-text message field, regardless of builder."""
+    soup = BeautifulSoup(html, "html.parser")
+    for form in soup.find_all("form"):
+        haystack = " ".join([
+            form.get("id", "") or "",
+            " ".join(form.get("class", []) or []),
+            form.get("action", "") or "",
+            form.get("name", "") or "",
+        ])
+        if _CONTACT_FORM_MARKERS_RE.search(haystack):
+            return True
+        has_email_input = (
+            form.find("input", attrs={"type": re.compile("^email$", re.IGNORECASE)}) is not None
+            or form.find("input", attrs={"name": re.compile("email", re.IGNORECASE)}) is not None
+        )
+        has_message_field = form.find("textarea") is not None
+        if has_email_input and has_message_field:
+            return True
+    return False
+
+
+def extract_page_metadata(html: str) -> dict:
+    """Pulls <title>, meta description, and OG title/description from an
+    already-fetched page — no extra requests. Useful for personalizing
+    outreach (knowing the business's own framing of itself) even on
+    domains where no email was found."""
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    page_title = title_tag.get_text(strip=True) if title_tag else ""
+
+    def _meta_content(**attrs) -> str:
+        tag = soup.find("meta", attrs=attrs)
+        content = tag.get("content", "").strip() if tag else ""
+        return content
+
+    return {
+        "page_title": page_title,
+        "meta_description": _meta_content(name=re.compile("^description$", re.IGNORECASE)),
+        "og_title": _meta_content(property="og:title"),
+        "og_description": _meta_content(property="og:description"),
+    }
+
+
 def _extract_all_from_html(html: str) -> dict:
     """Single combined extraction pass over one page's HTML, run once per
     fetched page instead of four separate executor round-trips for the
     same content."""
     return {
         "emails": extract_emails_from_html(html),
+        "mailto_emails": extract_mailto_emails(html),
         "phones": extract_phone_numbers_from_html(html),
         "whatsapp": extract_whatsapp_links_from_html(html),
         "social": extract_social_links_from_html(html),
+        "blocked_by": detect_blocked_signature(html),
+        "has_contact_form": detect_contact_form(html),
+        "metadata": extract_page_metadata(html),
     }
 
 
@@ -1260,7 +1684,7 @@ class PlaywrightFetcher:
 
     async def fetch(self, url: str) -> Optional[str]:
         try:
-            page = await self._browser.new_page(user_agent=random.choice(USER_AGENTS))
+            page = await self._browser.new_page(user_agent=get_user_agent_for_domain(url))
             try:
                 # "networkidle" is unreliable on real sites — analytics beacons,
                 # chat widgets, and websockets keep the network busy forever on
@@ -1281,6 +1705,75 @@ class PlaywrightFetcher:
             await self._pw.stop()
 
 
+async def _playwright_fetch_and_extract(pf: "PlaywrightFetcher", result: "DomainResult", base_url: str,
+                                         pages_to_check: list, delay: float, salvage_phones: set,
+                                         salvage_whatsapp: set, salvage_social: set) -> None:
+    """The actual per-domain fetch/extract work against an already-running
+    PlaywrightFetcher, factored out of playwright_fallback so a batch caller
+    (run_playwright_second_pass) can share one browser instance across many
+    domains instead of each domain paying its own launch cost.
+
+    salvage_phones/salvage_whatsapp/salvage_social are mutated in place
+    (merged via |=) with anything found on JS-rendered pages, so the
+    caller's salvage data reflects Playwright's fetches too, not just the
+    static pass's."""
+    fetched_any = False
+    urls_to_try = pages_to_check or [base_url]
+    extra_links: list = []
+
+    for page_url in urls_to_try[:MAX_PAGES_PER_DOMAIN]:
+        html = await pf.fetch(page_url)
+        await asyncio.sleep(delay)
+        if not html:
+            continue
+        fetched_any = True
+        if not pages_to_check:
+            # Homepage was previously unreachable/empty; now that we
+            # have JS-rendered HTML, look for contact links in it too.
+            extra_links = await _run_cpu(find_contact_links_on_page, html, base_url)
+        extracted = await _run_cpu(_extract_all_from_html, html)
+        if extracted["emails"]:
+            result.emails |= extracted["emails"]
+            result.source_pages.add(page_url)
+        if not result.blocked_by and extracted["blocked_by"]:
+            result.blocked_by = extracted["blocked_by"]
+        _apply_page_extras(result, {"has_contact_form": extracted["has_contact_form"], "mailto_emails": extracted["mailto_emails"], **extracted["metadata"]})
+        salvage_phones |= extracted["phones"]
+        salvage_whatsapp |= extracted["whatsapp"]
+        salvage_social |= extracted["social"]
+
+    for link_url in extra_links[:MAX_PAGES_PER_DOMAIN - 1]:
+        html = await pf.fetch(link_url)
+        await asyncio.sleep(delay)
+        if not html:
+            continue
+        fetched_any = True
+        extracted = await _run_cpu(_extract_all_from_html, html)
+        if extracted["emails"]:
+            result.emails |= extracted["emails"]
+            result.source_pages.add(link_url)
+        if not result.blocked_by and extracted["blocked_by"]:
+            result.blocked_by = extracted["blocked_by"]
+        _apply_page_extras(result, {"has_contact_form": extracted["has_contact_form"], "mailto_emails": extracted["mailto_emails"], **extracted["metadata"]})
+        salvage_phones |= extracted["phones"]
+        salvage_whatsapp |= extracted["whatsapp"]
+        salvage_social |= extracted["social"]
+
+    if result.emails:
+        result.method = f"{result.method}+playwright"
+        result.error = ""
+        result.fetch_failed = False
+    elif fetched_any:
+        # Playwright genuinely retrieved JS-rendered content (unlike
+        # the static pass, which may have set fetch_failed=True) and
+        # still found nothing — a real "checked and empty" result now,
+        # regardless of what the static pass concluded.
+        result.fetch_failed = False
+        result.error = "no emails found on checked pages (incl. JS-rendered)"
+    else:
+        result.error = result.error or "no emails found on checked pages (incl. JS-rendered)"
+
+
 async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_check: list, delay: float,
                                salvage_phones: set, salvage_whatsapp: set, salvage_social: set) -> None:
     """Re-fetches pages with a real headless browser when the static pass
@@ -1290,63 +1783,19 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
     wait here until a slot frees up, trading some wall-clock time for a
     bounded memory ceiling regardless of --workers.
 
-    salvage_phones/salvage_whatsapp/salvage_social are mutated in place
-    (merged via |=) with anything found on JS-rendered pages, so the
-    caller's salvage data reflects Playwright's fetches too, not just the
-    static pass's."""
+    This owns its own single-use browser lifecycle (launch + teardown) for
+    exactly one domain — used by process_domain's forced-Playwright path.
+    run_playwright_second_pass does NOT call this; it shares one browser
+    across a whole batch instead via _playwright_fetch_and_extract directly,
+    since launching a fresh Chromium per domain there would pay the ~25-30s
+    cold-start cost once per domain instead of once per batch."""
     async with _playwright_semaphore:
         try:
-            fetched_any = False
             async with PlaywrightFetcher() as pf:
-                urls_to_try = pages_to_check or [base_url]
-                extra_links: list = []
-
-                for page_url in urls_to_try[:MAX_PAGES_PER_DOMAIN]:
-                    html = await pf.fetch(page_url)
-                    await asyncio.sleep(delay)
-                    if not html:
-                        continue
-                    fetched_any = True
-                    if not pages_to_check:
-                        # Homepage was previously unreachable/empty; now that we
-                        # have JS-rendered HTML, look for contact links in it too.
-                        extra_links = await _run_cpu(find_contact_links_on_page, html, base_url)
-                    extracted = await _run_cpu(_extract_all_from_html, html)
-                    if extracted["emails"]:
-                        result.emails |= extracted["emails"]
-                        result.source_pages.add(page_url)
-                    salvage_phones |= extracted["phones"]
-                    salvage_whatsapp |= extracted["whatsapp"]
-                    salvage_social |= extracted["social"]
-
-                for link_url in extra_links[:MAX_PAGES_PER_DOMAIN - 1]:
-                    html = await pf.fetch(link_url)
-                    await asyncio.sleep(delay)
-                    if not html:
-                        continue
-                    fetched_any = True
-                    extracted = await _run_cpu(_extract_all_from_html, html)
-                    if extracted["emails"]:
-                        result.emails |= extracted["emails"]
-                        result.source_pages.add(link_url)
-                    salvage_phones |= extracted["phones"]
-                    salvage_whatsapp |= extracted["whatsapp"]
-                    salvage_social |= extracted["social"]
-
-            if result.emails:
-                result.method = f"{result.method}+playwright"
-                result.error = ""
-                result.fetch_failed = False
-            elif fetched_any:
-                # Playwright genuinely retrieved JS-rendered content (unlike
-                # the static pass, which may have set fetch_failed=True) and
-                # still found nothing — a real "checked and empty" result now,
-                # regardless of what the static pass concluded.
-                result.fetch_failed = False
-                result.error = "no emails found on checked pages (incl. JS-rendered)"
-            else:
-                result.error = result.error or "no emails found on checked pages (incl. JS-rendered)"
-
+                await _playwright_fetch_and_extract(
+                    pf, result, base_url, pages_to_check, delay,
+                    salvage_phones, salvage_whatsapp, salvage_social
+                )
         except ImportError:
             result.error = (
                 (result.error + "; " if result.error else "")
@@ -1359,69 +1808,152 @@ async def playwright_fallback(result: "DomainResult", base_url: str, pages_to_ch
 # --------------------------------------------------------------------------
 
 async def fetch_and_extract_pages(session: aiohttp.ClientSession, urls: list, robots: "RobotsPolicy",
-                                   delay: float, proxy: Optional[str] = None) -> tuple:
-    """Fetches a domain's candidate pages concurrently (they're independent
-    of each other, so there's no reason to wait for one before starting the
-    next) and extracts emails from each. `delay` staggers when each fetch
-    *starts* rather than serializing them — a soft rate limit that still
-    lets slow pages run in the background instead of blocking faster ones.
+                                   delay: float, proxy: Optional[str] = None,
+                                   min_pages_before_stop: int = MIN_PAGES_BEFORE_EARLY_STOP) -> tuple:
+    """Fetches a domain's candidate pages — which arrive already ranked
+    best-first (rank_contact_urls) — in waves of PER_DOMAIN_FETCH_WORKERS
+    pages at a time (independent within a wave, so no reason to wait for
+    one before starting the next in the same wave). Once an email has been
+    found AND at least `min_pages_before_stop` pages have been checked, the
+    remaining waves are skipped entirely rather than fetched anyway — a
+    politeness measure (don't send requests the answer no longer needs),
+    not just a speed one, since a genuinely lower-priority candidate never
+    even gets a request sent once a high-confidence one has already
+    answered. `delay` staggers when each fetch *starts* within a wave.
 
     Returns (emails, source_pages, fetched_ok_count, fetch_failed_count,
-    phones, whatsapp_links, social_links). fetched_ok_count/fetch_failed_count
-    exist specifically so the caller can tell "every candidate page failed to
-    fetch" (403/timeout/connection reset/exhausted retries) apart from "pages
-    fetched fine and genuinely had no email" — before this, both looked
-    identical (empty emails, empty source_pages), which silently broke
-    --retry-failed for exactly the case it was built to catch. The salvage
-    sets (phones/whatsapp_links/social_links) are extracted from the same
-    fetched HTML regardless of whether emails were found — no extra
-    requests — and it's up to the caller whether to expose them (only meant
-    for domains that end up with no email)."""
+    phones, whatsapp_links, social_links, blocked_by, page_extras).
+    fetched_ok_count/fetch_failed_count exist specifically so the caller can
+    tell "every candidate page failed to fetch" (403/timeout/connection
+    reset/exhausted retries) apart from "pages fetched fine and genuinely
+    had no email" — before this, both looked identical (empty emails, empty
+    source_pages), which silently broke --retry-failed for exactly the case
+    it was built to catch. The salvage sets (phones/whatsapp_links/
+    social_links) are extracted from the same fetched HTML regardless of
+    whether emails were found — no extra requests — and it's up to the
+    caller whether to expose them (only meant for domains that end up with
+    no email). blocked_by is the first known WAF/bot-challenge vendor
+    signature seen across every page checked (from either a 200 challenge-
+    page body or a rejected non-200 response's body), or "" if none
+    matched. page_extras is {"has_contact_form": bool (true if ANY checked
+    page had one), "page_title"/"meta_description"/"og_title"/
+    "og_description": str (from the first page that fetched successfully),
+    "mailto_emails": set (union across every page checked)}."""
     emails: set = set()
     source_pages: set = set()
     phones: set = set()
     whatsapp_links: set = set()
     social_links: set = set()
+    mailto_emails: set = set()
+    empty_page_extras = {
+        "has_contact_form": False, "page_title": "", "meta_description": "",
+        "og_title": "", "og_description": "", "mailto_emails": set(),
+    }
     allowed_urls = [u for u in urls if robots.can_fetch(u)]
     if not allowed_urls:
-        return emails, source_pages, 0, 0, phones, whatsapp_links, social_links
-
-    sem = asyncio.Semaphore(min(PER_DOMAIN_FETCH_WORKERS, len(allowed_urls)))
+        return emails, source_pages, 0, 0, phones, whatsapp_links, social_links, "", empty_page_extras
 
     async def _fetch_one(url: str) -> tuple:
-        async with sem:
-            resp = await fetch(session, url, proxy=proxy)
+        blocked_sink: list = []
+        resp = await fetch(session, url, proxy=proxy, blocked_sink=blocked_sink)
         if resp is None:
-            return url, None
-        return url, await _run_cpu(_extract_all_from_html, resp.text)
+            return url, None, (blocked_sink[0] if blocked_sink else "")
+        extracted = await _run_cpu(_extract_all_from_html, resp.text)
+        return url, extracted, extracted["blocked_by"]
 
-    tasks = []
-    for url in allowed_urls:
-        tasks.append(asyncio.create_task(_fetch_one(url)))
-        if delay:
-            await asyncio.sleep(delay)
-
-    # asyncio.gather (not as_completed) is required here: if this function's
-    # caller is itself cancelled (the per-domain hard timeout), gather
-    # propagates that cancellation to every task above before re-raising —
-    # as_completed does NOT, which left orphaned tasks running against an
-    # already-closed aiohttp session in testing (RuntimeError: Session is
-    # closed) once the parent's `async with ClientSession()` block exited.
-    results = await asyncio.gather(*tasks)
     fetched_ok = 0
     fetch_failed = 0
-    for url, extracted in results:
-        if extracted is None:
-            fetch_failed += 1
-            continue
-        fetched_ok += 1
-        if extracted["emails"]:
-            emails |= extracted["emails"]
-            source_pages.add(url)
-        phones |= extracted["phones"]
-        whatsapp_links |= extracted["whatsapp"]
-        social_links |= extracted["social"]
-    return emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp_links, social_links
+    checked_count = 0
+    blocked_by = ""
+    has_contact_form = False
+    page_metadata: Optional[dict] = None
+    wave_size = max(1, PER_DOMAIN_FETCH_WORKERS)
+
+    for wave_start in range(0, len(allowed_urls), wave_size):
+        wave_urls = allowed_urls[wave_start:wave_start + wave_size]
+        tasks = []
+        try:
+            for url in wave_urls:
+                tasks.append(asyncio.create_task(_fetch_one(url)))
+                if delay:
+                    await asyncio.sleep(delay)
+
+            # asyncio.gather (not as_completed) is required here: if this
+            # function's caller is itself cancelled (the per-domain hard
+            # timeout), gather propagates that cancellation to every task in
+            # this wave before re-raising — as_completed does NOT, which left
+            # orphaned tasks running against an already-closed aiohttp session
+            # in testing (RuntimeError: Session is closed) once the parent's
+            # `async with ClientSession()` block exited.
+            results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Cancellation can also land in the stagger sleep above, before
+            # gather() is ever reached — tasks already created via
+            # create_task() at that point are independent of this coroutine
+            # and gather() never gets a chance to cancel them. Without this,
+            # they keep running after this function (and the session it used)
+            # is torn down, and eventually crash with "Session is closed" —
+            # confirmed happening in a real batch run, not just theoretical.
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        for url, extracted, page_blocked_by in results:
+            checked_count += 1
+            if not blocked_by and page_blocked_by:
+                blocked_by = page_blocked_by
+            if extracted is None:
+                fetch_failed += 1
+                continue
+            fetched_ok += 1
+            if extracted["emails"]:
+                emails |= extracted["emails"]
+                source_pages.add(url)
+            phones |= extracted["phones"]
+            whatsapp_links |= extracted["whatsapp"]
+            social_links |= extracted["social"]
+            mailto_emails |= extracted["mailto_emails"]
+            has_contact_form = has_contact_form or extracted["has_contact_form"]
+            if page_metadata is None:
+                page_metadata = extracted["metadata"]
+
+        if emails and checked_count >= min_pages_before_stop:
+            break
+
+    metadata = page_metadata if page_metadata is not None else {
+        "page_title": "", "meta_description": "", "og_title": "", "og_description": "",
+    }
+    page_extras = {"has_contact_form": has_contact_form, "mailto_emails": mailto_emails, **metadata}
+    return (emails, source_pages, fetched_ok, fetch_failed, phones, whatsapp_links,
+            social_links, blocked_by, page_extras)
+
+
+def _is_retryable(r: "DomainResult") -> bool:
+    """Whether --retry-failed should re-attempt this domain: a connection-
+    class failure (method=="none", or candidate pages were found but every
+    one failed to fetch) that ISN'T a confirmed structural block. A domain
+    flagged blocked_by will fail again identically no matter how many times
+    it's retried, so retrying it just wastes a pass."""
+    return (r.method == "none" or r.fetch_failed) and not r.blocked_by
+
+
+def _is_low_quality_email_result(r: "DomainResult") -> bool:
+    """A domain already has an email, but it's a weak result worth trying to
+    upgrade with Playwright's JS-rendered second pass: either every email
+    found is on a third-party domain (a helpdesk widget, a booking tool)
+    with nothing on the business's own domain, or the best available email
+    's role couldn't be classified as anything specific ("other" — not
+    general/support/sales/personal/etc). A real, own-domain, clearly-
+    classified contact (info@, support@, jane@) is left alone — this is only
+    for results that technically "found an email" but that a human
+    reviewing the CSV would flag as not good enough yet."""
+    if not r.emails:
+        return False
+    own = [e for e in r.emails if email_matches_domain(e, r.domain)]
+    if not own:
+        return True
+    best = rank_emails_by_role(own, r.mailto_emails)[0]
+    return classify_email_role(best) == "other"
 
 
 def _decide_empty_result_status(pages_fetched_ok: int, pages_fetch_failed: int) -> tuple:
@@ -1440,6 +1972,24 @@ def _decide_empty_result_status(pages_fetched_ok: int, pages_fetch_failed: int) 
             "returned a response — not a genuine \"no email\" result)"
         )
     return False, "no emails found on checked pages"
+
+
+def _apply_page_extras(result: "DomainResult", page_extras: dict) -> None:
+    """Merges a fetch_and_extract_pages call's page_extras into a
+    DomainResult: has_contact_form is OR'd in (true if found on ANY pass),
+    mailto_emails is unioned in (accumulate across every pass), metadata
+    fields are first-non-empty-wins (an earlier pass's real title shouldn't
+    be overwritten by a later pass's page that had none)."""
+    result.has_contact_form = result.has_contact_form or page_extras["has_contact_form"]
+    result.mailto_emails |= page_extras["mailto_emails"]
+    if not result.page_title and page_extras["page_title"]:
+        result.page_title = page_extras["page_title"]
+    if not result.meta_description and page_extras["meta_description"]:
+        result.meta_description = page_extras["meta_description"]
+    if not result.og_title and page_extras["og_title"]:
+        result.og_title = page_extras["og_title"]
+    if not result.og_description and page_extras["og_description"]:
+        result.og_description = page_extras["og_description"]
 
 
 def _maybe_apply_salvage(result: "DomainResult", phones: set, whatsapp_links: set, social_links: set) -> None:
@@ -1481,6 +2031,9 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
     async with new_client_session(timeout) as session:
         try:
             robots = await fetch_robots_policy(session, base_url, proxy, respect_robots=respect_robots)
+            crawl_delay = robots.crawl_delay()
+            if crawl_delay is not None:
+                get_domain_rate_limiter(base_url).ensure_min_interval(crawl_delay)
 
             all_pages = await discover_all_page_urls(session, base_url, robots, proxy)
             # Offloaded like the sitemap/HTML parsing above — a huge sitemap
@@ -1497,7 +2050,10 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
             else:
                 result.method = "homepage-fallback"
                 if robots.can_fetch(base_url):
-                    home_resp = await fetch(session, base_url, proxy=proxy)
+                    home_blocked_sink: list = []
+                    home_resp = await fetch(session, base_url, proxy=proxy, blocked_sink=home_blocked_sink)
+                    if home_blocked_sink:
+                        result.blocked_by = home_blocked_sink[0]
                 if home_resp:
                     pages_to_check = [base_url]
                     extra_links = await _run_cpu(find_contact_links_on_page, home_resp.text, base_url)
@@ -1514,7 +2070,8 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                 return result
 
             result.pages_checked = pages_to_check[:MAX_PAGES_PER_DOMAIN]
-            emails, source_pages, fetched_ok, fetch_failed_count, phones, whatsapp_links, social_links = (
+            (emails, source_pages, fetched_ok, fetch_failed_count,
+             phones, whatsapp_links, social_links, page_blocked_by, page_extras) = (
                 await fetch_and_extract_pages(
                     session, result.pages_checked, robots, delay, proxy
                 )
@@ -1523,6 +2080,9 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
             result.source_pages |= source_pages
             total_fetched_ok = fetched_ok
             total_fetch_failed = fetch_failed_count
+            if not result.blocked_by and page_blocked_by:
+                result.blocked_by = page_blocked_by
+            _apply_page_extras(result, page_extras)
 
             # Shallow second hop: sitemap + footer-keyword discovery both failed
             # to surface anything useful, so try a few more same-domain nav links
@@ -1532,9 +2092,14 @@ async def process_domain(raw_url: str, delay: float, proxies: Optional[list], ve
                     find_second_hop_links, home_resp.text, base_url, set(pages_to_check)
                 )
                 (emails, source_pages, fetched_ok, fetch_failed_count,
-                 hop_phones, hop_whatsapp, hop_social) = await fetch_and_extract_pages(
-                    session, second_hop_urls, robots, delay, proxy
+                 hop_phones, hop_whatsapp, hop_social, hop_blocked_by, hop_page_extras) = (
+                    await fetch_and_extract_pages(
+                        session, second_hop_urls, robots, delay, proxy
+                    )
                 )
+                if not result.blocked_by and hop_blocked_by:
+                    result.blocked_by = hop_blocked_by
+                _apply_page_extras(result, hop_page_extras)
                 result.pages_checked += [u for u in second_hop_urls if u not in result.pages_checked]
                 result.emails |= emails
                 result.source_pages |= source_pages
@@ -1612,7 +2177,8 @@ CSV_FIELDNAMES = [
     "input_url", "domain", "primary_email", "primary_role",
     "own_domain_emails", "other_domain_emails",
     "phone", "whatsapp", "social_links",
-    "method", "source_pages", "error",
+    "method", "source_pages", "error", "blocked_by",
+    "has_contact_form", "page_title", "meta_description", "og_title", "og_description",
 ]
 
 
@@ -1623,9 +2189,9 @@ def result_to_row(r: "DomainResult") -> dict:
     sync."""
     own = [e for e in r.emails if email_matches_domain(e, r.domain)]
     other = [e for e in r.emails if e not in own]
-    own_ranked = rank_emails_by_role(own)
-    other_ranked = rank_emails_by_role(other)
-    primary_email, primary_role = pick_primary_email(own_ranked, other_ranked)
+    own_ranked = rank_emails_by_role(own, r.mailto_emails)
+    other_ranked = rank_emails_by_role(other, r.mailto_emails)
+    primary_email, primary_role = pick_primary_email(own_ranked, other_ranked, r.mailto_emails)
     return {
         "input_url": r.input_url,
         "domain": r.domain,
@@ -1639,6 +2205,12 @@ def result_to_row(r: "DomainResult") -> dict:
         "method": r.method,
         "source_pages": "; ".join(sorted(r.source_pages)),
         "error": r.error,
+        "blocked_by": r.blocked_by,
+        "has_contact_form": r.has_contact_form,
+        "page_title": r.page_title,
+        "meta_description": r.meta_description,
+        "og_title": r.og_title,
+        "og_description": r.og_description,
     }
 
 
@@ -1650,19 +2222,29 @@ DEFAULT_BATCH_HISTORY_LOG = "batch_history.jsonl"
 
 
 def classify_domain_result(r: "DomainResult") -> str:
-    """Categorizes a single result into one of four mutually exclusive
-    hit-rate buckets: email_found, connection_failed (method=="none"/""
-    or fetch_failed — no real page content was ever retrieved),
-    salvage_only (no email, but pages fetched fine and phone/WhatsApp/
-    social was recovered), or genuine_no_result (pages fetched fine,
-    genuinely nothing at all). Every DomainResult falls into exactly one
-    bucket."""
+    """Categorizes a single result into one of six mutually exclusive
+    hit-rate buckets: email_found, permanently_blocked (a known WAF/bot-
+    challenge signature was detected — retrying is pointless, checked before
+    connection_failed since a blocked domain often also has method=="none"),
+    connection_failed (method=="none"/"" or fetch_failed — no real page
+    content was ever retrieved), salvage_only (no email, but pages fetched
+    fine and phone/WhatsApp/social was recovered), has_contact_form (no
+    email/salvage, but a genuine contact form was found — split out of
+    genuine_no_result since there's still a real way to reach them), or
+    genuine_no_result (pages fetched fine, truly nothing at all). Every
+    DomainResult falls into exactly one bucket. An email found despite a
+    detected block signature (e.g. only some pages were blocked) still
+    counts as email_found — a real result beats a partial-block label."""
     if r.emails:
         return "email_found"
+    if r.blocked_by:
+        return "permanently_blocked"
     if r.method in ("", "none") or r.fetch_failed:
         return "connection_failed"
     if r.phones or r.whatsapp_links or r.social_links:
         return "salvage_only"
+    if r.has_contact_form:
+        return "has_contact_form"
     return "genuine_no_result"
 
 
@@ -1670,7 +2252,10 @@ def summarize_batch(latest_category_by_url: dict) -> dict:
     """Turns a {input_url: category} mapping (the *final* category per
     domain — a retried domain's earlier category is overwritten) into the
     aggregate counts for one batch."""
-    counts = {"email_found": 0, "connection_failed": 0, "salvage_only": 0, "genuine_no_result": 0}
+    counts = {
+        "email_found": 0, "connection_failed": 0, "salvage_only": 0,
+        "genuine_no_result": 0, "permanently_blocked": 0, "has_contact_form": 0,
+    }
     for category in latest_category_by_url.values():
         counts[category] += 1
     return {"total": len(latest_category_by_url), **counts}
@@ -1716,14 +2301,24 @@ async def _process_domain_with_hard_timeout(sem: asyncio.Semaphore, url: str, de
     other domain in the batch forever. asyncio.wait_for actually cancels the
     coroutine at its next await point, which also frees this domain's
     semaphore slot for the next one — unlike an abandoned OS thread, which
-    keeps its worker slot occupied for as long as it keeps running."""
+    keeps its worker slot occupied for as long as it keeps running.
+
+    Also catches a bare asyncio.CancelledError, not just asyncio.TimeoutError:
+    confirmed in a real batch (81 domains, raised concurrency) that
+    wait_for's internal cancellation of process_domain can surface here as a
+    raw CancelledError instead of being converted to TimeoutError — this
+    killed the entire batch process outright rather than just giving up on
+    one domain. Nothing else in this codebase cancels these tasks directly,
+    so any CancelledError reaching this point can only be wait_for's own
+    timeout — safe to treat identically rather than let it escape and take
+    the whole run down with it."""
     async with sem:
         try:
             return await asyncio.wait_for(
                 process_domain(url, delay, proxies, verify_mx, use_playwright, respect_robots),
                 timeout=DOMAIN_HARD_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             r = DomainResult(input_url=url)
             r.domain = get_bare_domain(normalize_to_base_url(url))
             r.method = "none"
@@ -1792,7 +2387,14 @@ async def apply_playwright_to_result(r: "DomainResult", delay: float) -> "Domain
     """Re-applies Playwright to an already-processed domain, reusing its
     stored base_url/pages_checked instead of redoing sitemap discovery and
     ranking — the whole point of storing them was to keep a later targeted
-    pass cheap, not just correct."""
+    pass cheap, not just correct.
+
+    Launches its own single-use browser via playwright_fallback; kept for
+    the case of applying Playwright to one domain in isolation (e.g. tests,
+    or a future single-domain retry). run_playwright_second_pass does NOT
+    use this for batches — it shares one browser instance across all
+    targets instead, since this function's per-call browser launch is
+    exactly the cost a batch should avoid paying once per domain."""
     phones, whatsapp_links, social_links = set(r.phones), set(r.whatsapp_links), set(r.social_links)
     await playwright_fallback(r, r.base_url, r.pages_checked, delay, phones, whatsapp_links, social_links)
     _maybe_apply_salvage(r, phones, whatsapp_links, social_links)
@@ -1815,15 +2417,64 @@ async def run_playwright_second_pass(targets: list, delay: float) -> AsyncIterat
     entirely as redundant (Playwright already ran for every such domain
     during the main pass in that case).
 
-    Concurrent asyncio tasks are fine here despite MAX_CONCURRENT_PLAYWRIGHT_INSTANCES
-    limiting actual browser instances to 1 at a time — playwright_fallback's
-    own semaphore already serializes real Chromium usage; this just queues
-    the requests for it instead of running them one Python call at a time."""
-    async def _apply(r: "DomainResult") -> "DomainResult":
-        return await apply_playwright_to_result(r, delay)
+    Launches exactly ONE Chromium instance for the whole pass and reuses it
+    across every domain in `targets`, processing them sequentially — a
+    single browser launch is the dominant cost (~25-30s cold start measured
+    locally), so a naive per-domain PlaywrightFetcher() (as playwright_fallback
+    uses) would pay that cost on every domain in the pass, not just the
+    first. Sequential rather than concurrent because MAX_CONCURRENT_PLAYWRIGHT_INSTANCES
+    already limits real Chromium usage to one at a time regardless, and one
+    shared instance can only serve one page-fetch at a time here anyway."""
+    if not targets:
+        return
+    async with _playwright_semaphore:
+        try:
+            async with PlaywrightFetcher() as pf:
+                for r in targets:
+                    phones, whatsapp_links, social_links = (
+                        set(r.phones), set(r.whatsapp_links), set(r.social_links)
+                    )
+                    await _playwright_fetch_and_extract(
+                        pf, r, r.base_url, r.pages_checked, delay,
+                        phones, whatsapp_links, social_links
+                    )
+                    _maybe_apply_salvage(r, phones, whatsapp_links, social_links)
+                    yield r
+        except ImportError:
+            for r in targets:
+                r.error = (
+                    (r.error + "; " if r.error else "")
+                    + "playwright not installed — run: pip install playwright && playwright install chromium"
+                )
+                yield r
 
-    for coro in asyncio.as_completed([_apply(r) for r in targets]):
-        yield await coro
+
+def _finalize_csv(output_path: str, latest_result_by_url: dict) -> None:
+    """Collapses the output CSV down to one row per domain once processing
+    finishes. The main pass, --retry-failed pass, and Playwright second pass
+    each stream-write a row for every result they produce (so a crash
+    mid-run still leaves a resumable file), but a domain touched by more
+    than one pass ends up with multiple rows — a stale first attempt plus
+    the final one — unless something collapses them afterward. This keeps
+    the first-seen row order but replaces the row for any input_url present
+    in latest_result_by_url with that pass's truly final result, and drops
+    repeat rows for the same input_url."""
+    with open(output_path, newline="", encoding="utf-8") as f:
+        existing_rows = list(csv.DictReader(f))
+
+    seen = set()
+    final_rows = []
+    for row in existing_rows:
+        url = row["input_url"]
+        if url in seen:
+            continue
+        seen.add(url)
+        final_rows.append(result_to_row(latest_result_by_url[url]) if url in latest_result_by_url else row)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(final_rows)
 
 
 async def run_batch(input_path: str, output_path: str, max_workers: int = 10, delay: float = 0.3,
@@ -1887,7 +2538,7 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
             writer.writerow(result_to_row(r))
             f.flush()
             latest_result_by_url[r.input_url] = r
-            if retry_failed and (r.method == "none" or r.fetch_failed):
+            if retry_failed and _is_retryable(r):
                 retryable_urls.append(r.input_url)
             status = f"{len(r.emails)} email(s)" if r.emails else (r.error or "no result")
             print(f"[{done_count}/{total}] {r.domain or r.input_url}: {status}", flush=True)
@@ -1898,8 +2549,12 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
             # case where candidate pages WERE identified (method is "sitemap"
             # or "homepage-fallback") but every one of them failed to fetch —
             # transient blip or temporary rate-limiting rather than a
-            # permanent block. Domains that DID connect but genuinely have no
-            # email ("no emails found on checked pages") are excluded:
+            # permanent block. Domains flagged blocked_by (a detected WAF/
+            # bot-challenge signature) are excluded even if they'd otherwise
+            # qualify — retrying a confirmed structural block wastes a pass
+            # on something that will never succeed. Domains that DID connect
+            # but genuinely have no email ("no emails found on checked
+            # pages") are excluded too:
             # retrying won't change a real absence of contact info. A cooldown
             # before the retry pass gives any temporary throttling a real
             # chance to have cleared, and a lower worker count is gentler on
@@ -1921,13 +2576,25 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
                       flush=True)
 
         if playwright_second_pass:
-            pw_targets = [
+            no_result_targets = [
                 r for r in latest_result_by_url.values()
                 if classify_domain_result(r) == "genuine_no_result"
             ]
+            # Also targets domains that already "found an email" but weakly
+            # (third-party-only, or unclassifiable role) — Playwright reuses
+            # the same pages_checked, so this is one more targeted look at
+            # already-identified candidates, not a new crawl.
+            low_quality_targets = [
+                r for r in latest_result_by_url.values()
+                if classify_domain_result(r) == "email_found" and _is_low_quality_email_result(r)
+            ]
+            pw_targets = no_result_targets + low_quality_targets
             if pw_targets:
-                print(f"Running Playwright on {len(pw_targets)} domain(s) with genuinely no "
-                      "result (targeted second pass, not forced on every domain)...", flush=True)
+                print(f"Running Playwright on {len(pw_targets)} domain(s): "
+                      f"{len(no_result_targets)} with genuinely no result, "
+                      f"{len(low_quality_targets)} with a weak/low-quality email worth "
+                      "trying to upgrade (targeted second pass, not forced on every domain)...",
+                      flush=True)
                 pw_done = 0
                 async for r in run_playwright_second_pass(pw_targets, delay):
                     writer.writerow(result_to_row(r))
@@ -1938,12 +2605,16 @@ async def run_batch(input_path: str, output_path: str, max_workers: int = 10, de
                     print(f"[playwright {pw_done}/{len(pw_targets)}] {r.domain or r.input_url}: {status}",
                           flush=True)
 
+    _finalize_csv(output_path, latest_result_by_url)
+
     summary = summarize_batch({u: classify_domain_result(r) for u, r in latest_result_by_url.items()})
     log_batch_summary(summary, history_log_path)
     print(f"Batch summary: {summary['total']} domain(s) — "
           f"{summary['email_found']} with email, "
           f"{summary['salvage_only']} salvage-only (phone/WhatsApp/social, no email), "
+          f"{summary['has_contact_form']} contact-form only (no email/salvage, but a contact form was found), "
           f"{summary['genuine_no_result']} genuinely no result, "
+          f"{summary['permanently_blocked']} permanently blocked (WAF/bot-challenge signature detected), "
           f"{summary['connection_failed']} connection failed. "
           f"Logged to {history_log_path}.", flush=True)
 

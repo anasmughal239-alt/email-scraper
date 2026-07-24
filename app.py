@@ -261,13 +261,19 @@ async def _run_batch_live(domains, max_workers, delay, proxies, verify_mx, use_p
                 table_placeholder.dataframe(pd.DataFrame(list(recent)), width='stretch')
 
         if playwright_second_pass:
-            pw_targets = [
+            no_result_targets = [
                 r for r in latest_result_by_url.values()
                 if es.classify_domain_result(r) == "genuine_no_result"
             ]
+            low_quality_targets = [
+                r for r in latest_result_by_url.values()
+                if es.classify_domain_result(r) == "email_found" and es._is_low_quality_email_result(r)
+            ]
+            pw_targets = no_result_targets + low_quality_targets
             if pw_targets:
-                status_text.text(f"Running Playwright on {len(pw_targets)} domain(s) with "
-                                  "genuinely no result (targeted second pass)...")
+                status_text.text(f"Running Playwright on {len(pw_targets)} domain(s): "
+                                  f"{len(no_result_targets)} with no result, "
+                                  f"{len(low_quality_targets)} with a weak email to try to upgrade...")
                 pw_done = 0
                 async for r in es.run_playwright_second_pass(pw_targets, delay):
                     row = es.result_to_row(r)
@@ -385,11 +391,13 @@ if run_clicked:
 if st.session_state.get("last_batch_summary"):
     summary = st.session_state.last_batch_summary
     st.subheader("📊 Batch summary")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("With email", summary["email_found"])
     col2.metric("Salvage only", summary["salvage_only"])
-    col3.metric("Genuinely no result", summary["genuine_no_result"])
-    col4.metric("Connection failed", summary["connection_failed"])
+    col3.metric("Contact form only", summary["has_contact_form"])
+    col4.metric("Genuinely no result", summary["genuine_no_result"])
+    col5.metric("Permanently blocked", summary["permanently_blocked"])
+    col6.metric("Connection failed", summary["connection_failed"])
 
     history = es.load_batch_history(BATCH_HISTORY_PATH)
     if len(history) > 1:
